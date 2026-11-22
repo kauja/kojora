@@ -68,9 +68,11 @@ controller. Default workspace builds exclude the GUI.
 
 ## Explicit limitations
 
-- This is not yet a remote worker or daemon; closing the GUI during a running
-  task can interrupt tracking and may leave the child process running.
-  Do not close Studio until the agent finishes.
+- Local mode still ties task tracking to the GUI process. Closing local-mode
+  Studio while a task is running can leave an orphan.
+- Worker-connected mode uses `kojora-worker` and `--worker-socket ABSOLUTE_PATH`.
+  Closing/reopening the GUI does **not** stop a Worker task. A Worker crash
+  can still leave an orphan. See [Worker Daemon](WORKER.md).
 - The startup recovery flag marks unfinished tasks `Interrupted`, but
   does not locate or kill orphan processes.
 - An optional **explicitly confirmed edit mode** can launch Codex

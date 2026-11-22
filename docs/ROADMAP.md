@@ -19,11 +19,13 @@ Milestones are capability targets, not release-date promises.
 - [x] Local durable Bot/Task/Run/Session metadata and interrupted-run markers (experimental)
 - [ ] True resumable sessions and robust crash/process reconciliation
 - [ ] Isolate provider configuration/authentication profiles
-- [ ] Expose a versioned local control API and structured event stream
+- [x] Private versioned Unix-domain Worker control API (experimental)
+- [ ] Structured event subscription and remote control API
 
 ## M2 — Resource-aware orchestration
 
-- [ ] Host process-tree memory, CPU and pressure telemetry
+- [x] Per-process Unix CPU/virtual memory ceilings with single-task admission
+- [ ] Aggregate process-tree RSS/CPU telemetry and resource budgets
 - [ ] Admission control, budgets, queues and audit logs
 - [ ] Multiple agent sessions and Git worktree isolation
 - [ ] Safe pause/resume where agent adapters support it

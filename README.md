@@ -94,6 +94,26 @@ the agent's process group and records a durable `Cancelled` status.
 
 Read [Studio MVP](docs/STUDIO_MVP.md) for security boundaries and limitations.
 
+## Persistent local Worker Daemon (experimental)
+
+Run a separate headless Worker to keep managing tasks after the GUI closes.
+Both use one owner-private Unix socket; only the Worker holds the state lock.
+
+```sh
+mkdir -p "$HOME/.local/state/kojora" && chmod 700 "$HOME/.local/state/kojora"
+# Terminal 1: Worker process with explicit CPU and virtual-memory ceilings
+cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --cpu-seconds 900 --address-space-mib 8192
+# Terminal 2: GUI client (can disconnect and reconnect)
+cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/kojora/worker.sock"
+# Terminal 3: status and clean shutdown (refused while a task is active)
+cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --status
+cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --stop
+```
+
+**Resource semantics:** CPU seconds and virtual address space are *per process*,
+not wall time, physical RSS or the sum of descendants. Limits are optional;
+the Worker currently accepts one active task. See [Worker Daemon](docs/WORKER.md).
+
 ## Open design questions
 
 - Versioned plugin contract: in-process Rust, WASM components and/or IPC
