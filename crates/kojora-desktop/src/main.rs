@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use kojora_studio::{
+    checks::{CheckKind, HookPhase},
     default_data_dir, extract_agent_text, worker::StudioConnection, AgentMode, StudioState,
     TaskRecord, TaskStatus,
 };
@@ -18,6 +19,7 @@ struct DesktopApp {
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
+    selected_check: Option<u64>,
     history_page: usize,
     adding_bot: bool,
     new_bot_name: String,
@@ -50,6 +52,7 @@ impl DesktopApp {
             error,
             selected_bot: None,
             selected_task: None,
+            selected_check: None,
             history_page: 0,
             adding_bot: false,
             new_bot_name: String::new(),
@@ -413,6 +416,46 @@ impl DesktopApp {
                     ui.ctx().copy_text(worktree.to_string_lossy().to_string());
                 }
             }
+            if run.worktree_dir.is_some() && task.status != TaskStatus::Running {
+                if let Some(studio) = &self.studio {
+                    ui.separator();
+                    ui.label("Central checks (trusted worktrees only)");
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, kind) in [
+                            ("Queue fmt", CheckKind::RustFmt),
+                            ("Queue clippy", CheckKind::RustClippy),
+                            ("Queue tests", CheckKind::RustTest),
+                        ] {
+                            if ui.small_button(name).clicked() {
+                                self.notice = match studio.queue_check(task_id, HookPhase::Manual, kind) {
+                                    Ok(id) => format!("Check #{id} queued by Worker"),
+                                    Err(error) => format!("Cannot queue check: {error}"),
+                                };
+                            }
+                        }
+                    });
+                    if let Ok(checks) = studio.checks() {
+                        for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
+                            ui.horizontal(|ui| {
+                                let label = format!("#{} {:?}: {:?}", check.id, check.kind, check.status);
+                                if ui.small_button(label).clicked() {
+                                    self.selected_check = Some(check.id);
+                                    self.show_diff = false;
+                                }
+                            });
+                        }
+                        if let Some(check_id) = self.selected_check {
+                            if checks.iter().any(|r| r.id == check_id && r.task_id == task_id) {
+                                if ui.small_button("Return to agent log").clicked() {
+                                    self.selected_check = None;
+                                }
+                            } else {
+                                self.selected_check = None;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(dir) = &run.run_dir {
                 ui.separator();
                 ui.label("Run directory");
@@ -437,14 +480,16 @@ impl DesktopApp {
         ui.separator();
 
         if let Some(studio) = &self.studio {
-            let output_result = if self.show_diff {
+            let output_result = if let Some(check_id) = self.selected_check {
+                studio.check_log(check_id, self.show_stderr)
+            } else if self.show_diff {
                 studio.read_worktree_diff(task_id)
             } else {
                 studio.read_log_tail(task_id, self.show_stderr)
             };
             match output_result {
                 Ok(raw) => {
-                    let output = if !self.show_diff && !self.show_stderr && !self.show_raw_events {
+                    let output = if self.selected_check.is_none() && !self.show_diff && !self.show_stderr && !self.show_raw_events {
                         let text = extract_agent_text(&raw);
                         if text.is_empty() {
                             raw
