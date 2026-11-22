@@ -4,8 +4,9 @@
 use eframe::egui;
 use kojora_studio::{
     checks::{CheckKind, HookPhase},
-    default_data_dir, extract_agent_text, worker::StudioConnection, AgentMode, StudioState,
-    TaskRecord, TaskStatus,
+    default_data_dir, extract_agent_text,
+    worker::StudioConnection,
+    AgentMode, StudioState, TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -427,17 +428,19 @@ impl DesktopApp {
                             ("Queue tests", CheckKind::RustTest),
                         ] {
                             if ui.small_button(name).clicked() {
-                                self.notice = match studio.queue_check(task_id, HookPhase::Manual, kind) {
-                                    Ok(id) => format!("Check #{id} queued by Worker"),
-                                    Err(error) => format!("Cannot queue check: {error}"),
-                                };
+                                self.notice =
+                                    match studio.queue_check(task_id, HookPhase::Manual, kind) {
+                                        Ok(id) => format!("Check #{id} queued by Worker"),
+                                        Err(error) => format!("Cannot queue check: {error}"),
+                                    };
                             }
                         }
                     });
                     if let Ok(checks) = studio.checks() {
                         for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
                             ui.horizontal(|ui| {
-                                let label = format!("#{} {:?}: {:?}", check.id, check.kind, check.status);
+                                let label =
+                                    format!("#{} {:?}: {:?}", check.id, check.kind, check.status);
                                 if ui.small_button(label).clicked() {
                                     self.selected_check = Some(check.id);
                                     self.show_diff = false;
@@ -445,7 +448,10 @@ impl DesktopApp {
                             });
                         }
                         if let Some(check_id) = self.selected_check {
-                            if checks.iter().any(|r| r.id == check_id && r.task_id == task_id) {
+                            if checks
+                                .iter()
+                                .any(|r| r.id == check_id && r.task_id == task_id)
+                            {
                                 if ui.small_button("Return to agent log").clicked() {
                                     self.selected_check = None;
                                 }
@@ -489,7 +495,11 @@ impl DesktopApp {
             };
             match output_result {
                 Ok(raw) => {
-                    let output = if self.selected_check.is_none() && !self.show_diff && !self.show_stderr && !self.show_raw_events {
+                    let output = if self.selected_check.is_none()
+                        && !self.show_diff
+                        && !self.show_stderr
+                        && !self.show_raw_events
+                    {
                         let text = extract_agent_text(&raw);
                         if text.is_empty() {
                             raw

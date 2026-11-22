@@ -25,21 +25,25 @@ impl AdmissionPolicy {
 
     pub fn validate(self) -> io::Result<()> {
         if self.max_parallel == 0 || self.max_parallel > 32 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "max_parallel must be between 1 and 32"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_parallel must be between 1 and 32",
+            ));
         }
-        if self.max_parallel > 1
-            && (self.memory_mib_per_task == 0 || self.total_memory_mib == 0)
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "parallel execution requires an explicit memory budget"));
+        if self.max_parallel > 1 && (self.memory_mib_per_task == 0 || self.total_memory_mib == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parallel execution requires an explicit memory budget",
+            ));
         }
         if self.memory_mib_per_task > 0
             && (self.total_memory_mib < self.memory_mib_per_task
                 || self.memory_mib_per_task.checked_mul(1024 * 1024).is_none())
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "invalid per-task memory reservation"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid per-task memory reservation",
+            ));
         }
         Ok(())
     }
@@ -59,7 +63,10 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(policy: AdmissionPolicy) -> io::Result<Self> {
         policy.validate()?;
-        Ok(Self { policy, tasks: BTreeMap::new() })
+        Ok(Self {
+            policy,
+            tasks: BTreeMap::new(),
+        })
     }
 
     pub fn max_parallel(&self) -> usize {
@@ -84,25 +91,44 @@ impl Scheduler {
 
     pub fn admit(&mut self, id: u64, profile_dir: PathBuf) -> io::Result<CancellationToken> {
         if self.tasks.len() >= self.policy.max_parallel {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "worker reached maximum concurrent task count"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "worker reached maximum concurrent task count",
+            ));
         }
         let next = (self.tasks.len() as u64 + 1)
             .checked_mul(self.policy.memory_mib_per_task)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "budget overflow"))?;
         if self.policy.memory_mib_per_task != 0 && next > self.policy.total_memory_mib {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "worker memory reservations exhausted"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "worker memory reservations exhausted",
+            ));
         }
-        if self.tasks.values().any(|active| active.profile_dir == profile_dir) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "another run already holds this provider profile"));
+        if self
+            .tasks
+            .values()
+            .any(|active| active.profile_dir == profile_dir)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another run already holds this provider profile",
+            ));
         }
         if self.tasks.contains_key(&id) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "task ID is already active"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "task ID is already active",
+            ));
         }
         let token = CancellationToken::default();
-        self.tasks.insert(id, ActiveTask { profile_dir, token: token.clone() });
+        self.tasks.insert(
+            id,
+            ActiveTask {
+                profile_dir,
+                token: token.clone(),
+            },
+        );
         Ok(token)
     }
 
@@ -117,13 +143,19 @@ mod tests {
     #[test]
     fn admits_two_distinct_profiles_then_releases_reservation() {
         let mut s = Scheduler::new(AdmissionPolicy {
-            max_parallel: 3, memory_mib_per_task: 512, total_memory_mib: 1024
-        }).unwrap();
+            max_parallel: 3,
+            memory_mib_per_task: 512,
+            total_memory_mib: 1024,
+        })
+        .unwrap();
         let a = s.admit(1, "/profiles/a".into()).unwrap();
         let b = s.admit(2, "/profiles/b".into()).unwrap();
         assert_eq!(s.active_count(), 2);
         assert_eq!(s.reserved_mib(), 1024);
-        assert_eq!(s.admit(3, "/profiles/c".into()).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            s.admit(3, "/profiles/c".into()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         a.cancel();
         assert!(s.token(1).unwrap().is_cancelled());
         assert!(!b.is_cancelled());
@@ -135,12 +167,21 @@ mod tests {
     #[test]
     fn rejects_profile_reuse_and_unbounded_parallel_config() {
         let mut s = Scheduler::new(AdmissionPolicy {
-            max_parallel: 4, memory_mib_per_task: 256, total_memory_mib: 4096
-        }).unwrap();
+            max_parallel: 4,
+            memory_mib_per_task: 256,
+            total_memory_mib: 4096,
+        })
+        .unwrap();
         s.admit(1, "/profiles/a".into()).unwrap();
-        assert_eq!(s.admit(2, "/profiles/a".into()).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            s.admit(2, "/profiles/a".into()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert!(Scheduler::new(AdmissionPolicy {
-            max_parallel: 4, memory_mib_per_task: 0, total_memory_mib: 0
-        }).is_err());
+            max_parallel: 4,
+            memory_mib_per_task: 0,
+            total_memory_mib: 0
+        })
+        .is_err());
     }
 }

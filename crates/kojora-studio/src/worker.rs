@@ -4,8 +4,8 @@
 
 #![cfg(unix)]
 
-use crate::{AgentMode, Studio, StudioState, TaskStatus};
 use crate::checks::{CheckKind, CheckPolicy, CheckQueue, CheckRecord, HookPhase};
+use crate::{AgentMode, Studio, StudioState, TaskStatus};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -13,10 +13,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 64 * 1024;
@@ -45,7 +45,10 @@ enum Request {
     Status,
     Snapshot,
     Checks,
-    CheckLog { check_id: u64, stderr: bool },
+    CheckLog {
+        check_id: u64,
+        stderr: bool,
+    },
     QueueCheck {
         task_id: u64,
         hook: HookPhase,
@@ -169,22 +172,40 @@ fn dispatch(
         Request::Snapshot => (Response::Snapshot(studio.snapshot()?), false),
         Request::Checks => (Response::Checks(checks.snapshot()?), false),
         Request::CheckLog { check_id, stderr } => (
-            Response::Text(checks.read_log_tail(check_id, stderr)?), false
+            Response::Text(checks.read_log_tail(check_id, stderr)?),
+            false,
         ),
-        Request::QueueCheck { task_id, hook, kind } => {
+        Request::QueueCheck {
+            task_id,
+            hook,
+            kind,
+        } => {
             let state = studio.snapshot()?;
-            let task = state.tasks.iter().find(|t| t.id == task_id)
+            let task = state
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task does not exist"))?;
             if task.mode != AgentMode::EditWorktree || task.status == TaskStatus::Running {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                    "checks require a completed editable task worktree"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "checks require a completed editable task worktree",
+                ));
             }
-            let run = state.runs.iter().find(|r| r.task_id == task_id)
+            let run = state
+                .runs
+                .iter()
+                .find(|r| r.task_id == task_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "run missing"))?;
-            let workspace = run.worktree_dir.as_ref().ok_or_else(||
-                io::Error::new(io::ErrorKind::NotFound, "task has no worktree"))?;
-            (Response::Id(checks.enqueue(task_id, hook, kind, workspace)?), false)
-        },
+            let workspace = run
+                .worktree_dir
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task has no worktree"))?;
+            (
+                Response::Id(checks.enqueue(task_id, hook, kind, workspace)?),
+                false,
+            )
+        }
         Request::AddBot {
             name,
             workspace,
@@ -212,8 +233,10 @@ fn dispatch(
         Request::Diff { task_id } => (Response::Text(studio.read_worktree_diff(task_id)?), false),
         Request::Shutdown => {
             if studio.is_active() || checks.pending_count() != 0 {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                    "worker has active tasks or checks; cancel/wait for completion"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "worker has active tasks or checks; cancel/wait for completion",
+                ));
             }
             (Response::Ok, true)
         }
@@ -272,7 +295,9 @@ impl Drop for ObserverGuard {
 }
 
 pub fn serve_with_checks(
-    studio: Studio, limits: ProcessLimits, policy: CheckPolicy,
+    studio: Studio,
+    limits: ProcessLimits,
+    policy: CheckPolicy,
 ) -> io::Result<()> {
     limits.validate()?;
     let checks = CheckQueue::open(studio.data_dir().join("checks"), policy)?;
@@ -282,7 +307,8 @@ pub fn serve_with_checks(
         let check_copy = checks.clone();
         let studio_copy = Arc::clone(&studio);
         let active = Arc::clone(&running);
-        let handle = thread::Builder::new().name("kojora-post-edit-hooks".to_owned())
+        let handle = thread::Builder::new()
+            .name("kojora-post-edit-hooks".to_owned())
             .spawn(move || {
                 while active.load(Ordering::Acquire) {
                     if let Ok(snapshot) = studio_copy.snapshot() {
@@ -291,9 +317,15 @@ pub fn serve_with_checks(
                     thread::sleep(Duration::from_millis(250));
                 }
             })?;
-        ObserverGuard { running, handle: Some(handle) }
+        ObserverGuard {
+            running,
+            handle: Some(handle),
+        }
     } else {
-        ObserverGuard { running, handle: None }
+        ObserverGuard {
+            running,
+            handle: None,
+        }
     };
     // Studio::open already checked that the root is an absolute, private,
     // real directory. Do not require a canonical spelling: on macOS /var
@@ -410,21 +442,34 @@ impl WorkerClient {
     pub fn check_log(&self, check_id: u64, stderr: bool) -> io::Result<String> {
         match self.request(Request::CheckLog { check_id, stderr })? {
             Response::Text(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check log")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected check log",
+            )),
         }
     }
 
     pub fn checks(&self) -> io::Result<Vec<CheckRecord>> {
         match self.request(Request::Checks)? {
             Response::Checks(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check records")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected check records",
+            )),
         }
     }
 
     pub fn queue_check(&self, task_id: u64, hook: HookPhase, kind: CheckKind) -> io::Result<u64> {
-        match self.request(Request::QueueCheck { task_id, hook, kind })? {
+        match self.request(Request::QueueCheck {
+            task_id,
+            hook,
+            kind,
+        })? {
             Response::Id(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check ID")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected check ID",
+            )),
         }
     }
 
@@ -532,24 +577,30 @@ impl StudioConnection {
 
     pub fn check_log(&self, check_id: u64, stderr: bool) -> io::Result<String> {
         match self {
-            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "check logs require a separate Worker")),
+            Self::Local(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "check logs require a separate Worker",
+            )),
             Self::Worker(value) => value.check_log(check_id, stderr),
         }
     }
 
     pub fn checks(&self) -> io::Result<Vec<CheckRecord>> {
         match self {
-            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "local checks require a separate Worker")),
+            Self::Local(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "local checks require a separate Worker",
+            )),
             Self::Worker(value) => value.checks(),
         }
     }
 
     pub fn queue_check(&self, task_id: u64, hook: HookPhase, kind: CheckKind) -> io::Result<u64> {
         match self {
-            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "local checks require a separate Worker")),
+            Self::Local(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "local checks require a separate Worker",
+            )),
             Self::Worker(value) => value.queue_check(task_id, hook, kind),
         }
     }

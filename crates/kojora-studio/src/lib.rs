@@ -1,10 +1,10 @@
 //! Headless local studio control plane: durable bot/task/run records.
 //! No UI framework is used here. Execution is single-flight on purpose.
 
+pub mod checks;
+pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
-pub mod scheduler;
-pub mod checks;
 
 use scheduler::{AdmissionPolicy, Scheduler};
 
@@ -300,7 +300,9 @@ impl Studio {
     }
 
     pub fn active_task_ids(&self) -> Vec<u64> {
-        self.scheduler.lock().map_or_else(|_| Vec::new(), |s| s.active_ids())
+        self.scheduler
+            .lock()
+            .map_or_else(|_| Vec::new(), |s| s.active_ids())
     }
 
     /// Compatibility with the single-task GUI; parallel clients use all IDs.
@@ -309,12 +311,18 @@ impl Studio {
     }
 
     pub fn cancellation_requested(&self, task_id: u64) -> bool {
-        self.scheduler.lock().ok().and_then(|s| s.token(task_id))
+        self.scheduler
+            .lock()
+            .ok()
+            .and_then(|s| s.token(task_id))
             .is_some_and(|token| token.is_cancelled())
     }
 
     pub fn cancel_task(&self, task_id: u64) -> io::Result<()> {
-        let token = self.scheduler.lock().map_err(lock_error)?
+        let token = self
+            .scheduler
+            .lock()
+            .map_err(lock_error)?
             .token(task_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task is not active"))?;
         token.cancel();

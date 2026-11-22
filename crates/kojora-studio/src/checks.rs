@@ -44,7 +44,17 @@ impl CheckKind {
     fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::RustFmt => ("cargo", &["fmt", "--all", "--", "--check"]),
-            Self::RustClippy => ("cargo", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
+            Self::RustClippy => (
+                "cargo",
+                &[
+                    "clippy",
+                    "--workspace",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            ),
             Self::RustTest => ("cargo", &["test", "--workspace"]),
             Self::Ruff => ("ruff", &["check", "."]),
             Self::Biome => ("biome", &["check", "."]),
@@ -84,7 +94,10 @@ struct CheckJournal {
 
 impl Default for CheckJournal {
     fn default() -> Self {
-        Self { next_id: 1, records: Vec::new() }
+        Self {
+            next_id: 1,
+            records: Vec::new(),
+        }
     }
 }
 
@@ -115,35 +128,48 @@ impl Default for CheckPolicy {
 
 impl CheckPolicy {
     pub fn validate(&self) -> io::Result<()> {
-        if self.max_pending == 0 || self.max_pending > 64
-            || self.timeout_secs == 0 || self.timeout_secs > 3600
+        if self.max_pending == 0
+            || self.max_pending > 64
+            || self.timeout_secs == 0
+            || self.timeout_secs > 3600
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "check queue needs max_pending 1..64 and timeout 1..3600 seconds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "check queue needs max_pending 1..64 and timeout 1..3600 seconds",
+            ));
         }
         self.limits.validate()?;
         if !self.enabled && (!self.post_edit.is_empty() || !self.pre_merge.is_empty()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "hook recipes require explicit check enablement"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hook recipes require explicit check enablement",
+            ));
         }
-        if self.enabled && (self.limits.address_space_mib.is_none() || self.limits.cpu_seconds.is_none()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "enabled checks require explicit virtual-memory and CPU-time ceilings"));
+        if self.enabled
+            && (self.limits.address_space_mib.is_none() || self.limits.cpu_seconds.is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "enabled checks require explicit virtual-memory and CPU-time ceilings",
+            ));
         }
         Ok(())
     }
 
     fn permits(&self, hook: HookPhase, kind: CheckKind) -> bool {
-        self.enabled && match hook {
-            HookPhase::Manual => true,
-            HookPhase::PostEdit => self.post_edit.contains(&kind),
-            HookPhase::PreMerge => self.pre_merge.contains(&kind),
-        }
+        self.enabled
+            && match hook {
+                HookPhase::Manual => true,
+                HookPhase::PostEdit => self.post_edit.contains(&kind),
+                HookPhase::PreMerge => self.pre_merge.contains(&kind),
+            }
     }
 }
 
 type CheckRunner = dyn Fn(&Path, &Path, CheckKind, &CancellationToken, &CheckPolicy) -> io::Result<RunOutcome>
-    + Send + Sync + 'static;
+    + Send
+    + Sync
+    + 'static;
 
 struct Job {
     id: u64,
@@ -173,7 +199,10 @@ impl CheckQueue {
         policy.validate()?;
         let root = root.into();
         if !root.is_absolute() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "check data root must be absolute"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "check data root must be absolute",
+            ));
         }
         fs::create_dir_all(&root)?;
         #[cfg(unix)]
@@ -182,7 +211,10 @@ impl CheckQueue {
         let mut journal: CheckJournal = if path.exists() {
             let mut file = File::open(path)?;
             if file.metadata()?.len() > MAX_JOURNAL_BYTES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "check journal too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "check journal too large",
+                ));
             }
             let mut data = Vec::new();
             file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut data)?;
@@ -215,19 +247,31 @@ impl CheckQueue {
                     execute_job(&worker_root, &worker_policy, &shared, &*runner, job);
                 }
             })?;
-        Ok(Self { root, policy, activated_ms, journal, sender })
+        Ok(Self {
+            root,
+            policy,
+            activated_ms,
+            journal,
+            sender,
+        })
     }
 
     /// Return a bounded tail of a check log, never the entire compiler output.
     pub fn read_log_tail(&self, check_id: u64, stderr: bool) -> io::Result<String> {
         let records = self.snapshot()?;
-        let record = records.iter().find(|r| r.id == check_id)
+        let record = records
+            .iter()
+            .find(|r| r.id == check_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "check not found"))?;
-        let Some(run_dir) = &record.run_dir else { return Ok(String::new()) };
+        let Some(run_dir) = &record.run_dir else {
+            return Ok(String::new());
+        };
         let prefix = self.root.join("runs").join(format!("check-{check_id}"));
         if !run_dir.starts_with(&prefix) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "check log location is outside its private run directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "check log location is outside its private run directory",
+            ));
         }
         let name = if stderr { "stderr.log" } else { "stdout.log" };
         crate::tail_file(&run_dir.join(name), 32 * 1024)
@@ -246,63 +290,106 @@ impl CheckQueue {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.journal.lock().map_or(0, |journal| journal.records.iter().filter(|r|
-            matches!(r.status, CheckStatus::Queued | CheckStatus::Running)).count())
+        self.journal.lock().map_or(0, |journal| {
+            journal
+                .records
+                .iter()
+                .filter(|r| matches!(r.status, CheckStatus::Queued | CheckStatus::Running))
+                .count()
+        })
     }
 
     /// A request must reference an existing detached worktree belonging to
     /// exactly this task. No arbitrary paths cross the worker IPC boundary.
     pub fn enqueue(
-        &self, task_id: u64, hook: HookPhase, kind: CheckKind, workspace: &Path,
+        &self,
+        task_id: u64,
+        hook: HookPhase,
+        kind: CheckKind,
+        workspace: &Path,
     ) -> io::Result<u64> {
         if !self.policy.permits(hook, kind) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "check is not enabled for this hook"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "check is not enabled for this hook",
+            ));
         }
-        let expected = self.root.parent().ok_or_else(|| io::Error::other("check root has no parent"))?
-            .join("worktrees").join(format!("task-{task_id}"));
+        let expected = self
+            .root
+            .parent()
+            .ok_or_else(|| io::Error::other("check root has no parent"))?
+            .join("worktrees")
+            .join(format!("task-{task_id}"));
         let actual = fs::canonicalize(workspace)?;
         if fs::canonicalize(&expected)? != actual || !actual.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "check must use the task's own detached Git worktree"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "check must use the task's own detached Git worktree",
+            ));
         }
         let mut journal = self.journal.lock().map_err(lock_error)?;
-        if let Some(existing) = journal.records.iter().find(|record|
-            record.task_id == task_id && record.hook == hook && record.kind == kind
+        if let Some(existing) = journal.records.iter().find(|record| {
+            record.task_id == task_id
+                && record.hook == hook
+                && record.kind == kind
                 && (hook != HookPhase::Manual
-                    || matches!(record.status, CheckStatus::Queued | CheckStatus::Running)))
-        {
+                    || matches!(record.status, CheckStatus::Queued | CheckStatus::Running))
+        }) {
             return Ok(existing.id);
         }
-        if journal.records.iter().filter(|r|
-            matches!(r.status, CheckStatus::Queued | CheckStatus::Running)).count()
+        if journal
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, CheckStatus::Queued | CheckStatus::Running))
+            .count()
             >= self.policy.max_pending
         {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "local check queue is full"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "local check queue is full",
+            ));
         }
         let mut proposed = journal.clone();
         if proposed.records.len() >= MAX_RECORDS {
-            if let Some(index) = proposed.records.iter().position(|r|
-                !matches!(r.status, CheckStatus::Queued | CheckStatus::Running))
+            if let Some(index) = proposed
+                .records
+                .iter()
+                .position(|r| !matches!(r.status, CheckStatus::Queued | CheckStatus::Running))
             {
                 proposed.records.remove(index);
             } else {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "check history is full"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "check history is full",
+                ));
             }
         }
         let id = proposed.next_id;
-        proposed.next_id = id.checked_add(1)
+        proposed.next_id = id
+            .checked_add(1)
             .ok_or_else(|| io::Error::other("check ID exhausted"))?;
         proposed.records.push(CheckRecord {
-            id, task_id, hook, kind, status: CheckStatus::Queued,
-            created_ms: now_ms(), finished_ms: None, run_dir: None, error: None,
+            id,
+            task_id,
+            hook,
+            kind,
+            status: CheckStatus::Queued,
+            created_ms: now_ms(),
+            finished_ms: None,
+            run_dir: None,
+            error: None,
         });
         persist(&self.root, &proposed)?;
         *journal = proposed;
-        if self.sender.send(Job {
-            id, workspace: actual, token: CancellationToken::default()
-        }).is_err() {
+        if self
+            .sender
+            .send(Job {
+                id,
+                workspace: actual,
+                token: CancellationToken::default(),
+            })
+            .is_err()
+        {
             let mut candidate = journal.clone();
             if let Some(record) = candidate.records.iter_mut().find(|r| r.id == id) {
                 record.status = CheckStatus::Interrupted;
@@ -311,7 +398,10 @@ impl CheckQueue {
             }
             persist(&self.root, &candidate)?;
             *journal = candidate;
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "check worker stopped"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "check worker stopped",
+            ));
         }
         Ok(id)
     }
@@ -319,16 +409,25 @@ impl CheckQueue {
     /// Consult the durable journal to avoid duplicate post-edit hooks across
     /// UI reconnect and Worker restarts.
     pub fn observe_post_edit(&self, studio: &crate::StudioState) {
-        if self.policy.post_edit.is_empty() { return; }
+        if self.policy.post_edit.is_empty() {
+            return;
+        }
         for task in &studio.tasks {
             if task.mode != crate::AgentMode::EditWorktree
-                || task.status != crate::TaskStatus::Succeeded {
+                || task.status != crate::TaskStatus::Succeeded
+            {
                 continue;
             }
-            let Some(run) = studio.runs.iter().find(|r| r.task_id == task.id) else { continue };
+            let Some(run) = studio.runs.iter().find(|r| r.task_id == task.id) else {
+                continue;
+            };
             // Enabling hooks never backfills the whole old Task history.
-            if run.finished_ms.unwrap_or(0) < self.activated_ms { continue; }
-            let Some(worktree) = &run.worktree_dir else { continue };
+            if run.finished_ms.unwrap_or(0) < self.activated_ms {
+                continue;
+            }
+            let Some(worktree) = &run.worktree_dir else {
+                continue;
+            };
             for kind in &self.policy.post_edit {
                 if let Err(error) = self.enqueue(task.id, HookPhase::PostEdit, *kind, worktree) {
                     eprintln!("post-edit check for task {}: {error}", task.id);
@@ -339,18 +438,30 @@ impl CheckQueue {
 }
 
 fn execute_job(
-    root: &Path, policy: &CheckPolicy, shared: &Arc<Mutex<CheckJournal>>,
-    runner: &CheckRunner, job: Job,
+    root: &Path,
+    policy: &CheckPolicy,
+    shared: &Arc<Mutex<CheckJournal>>,
+    runner: &CheckRunner,
+    job: Job,
 ) {
-    let mut guard = match shared.lock() { Ok(v) => v, Err(_) => return };
-    let Some(record) = guard.records.iter().find(|r| r.id == job.id) else { return };
-    if record.status != CheckStatus::Queued { return }
+    let mut guard = match shared.lock() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(record) = guard.records.iter().find(|r| r.id == job.id) else {
+        return;
+    };
+    if record.status != CheckStatus::Queued {
+        return;
+    }
     let kind = record.kind;
     let mut proposed = guard.clone();
     if let Some(record) = proposed.records.iter_mut().find(|r| r.id == job.id) {
         record.status = CheckStatus::Running;
     }
-    if persist(root, &proposed).is_err() { return }
+    if persist(root, &proposed).is_err() {
+        return;
+    }
     *guard = proposed;
     drop(guard);
 
@@ -361,7 +472,10 @@ fn execute_job(
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let timeout = Duration::from_secs(policy.timeout_secs);
     let watcher = thread::spawn(move || {
-        if matches!(done_rx.recv_timeout(timeout), Err(mpsc::RecvTimeoutError::Timeout)) {
+        if matches!(
+            done_rx.recv_timeout(timeout),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
             timed_out_worker.store(true, Ordering::Release);
             stopper.cancel();
         }
@@ -384,7 +498,9 @@ fn execute_job(
             };
             let reason = if timed_out.load(Ordering::Acquire) {
                 Some("check exceeded wall-clock timeout".to_owned())
-            } else { None };
+            } else {
+                None
+            };
             (status, reason, Some(result.run_dir))
         }
         Err(error) => (CheckStatus::Failed, Some(error.to_string()), None),
@@ -406,11 +522,16 @@ fn execute_job(
 }
 
 fn execute_builtin(
-    workspace: &Path, log_root: &Path, kind: CheckKind,
-    token: &CancellationToken, policy: &CheckPolicy,
+    workspace: &Path,
+    log_root: &Path,
+    kind: CheckKind,
+    token: &CancellationToken,
+    policy: &CheckPolicy,
 ) -> io::Result<RunOutcome> {
     let (program, args) = kind.command();
-    let target_dir = log_root.parent().and_then(Path::parent)
+    let target_dir = log_root
+        .parent()
+        .and_then(Path::parent)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid check path"))?
         .join("target");
     fs::create_dir_all(&target_dir)?;
@@ -422,20 +543,30 @@ fn execute_builtin(
         .chain([
             (OsString::from("CARGO_BUILD_JOBS"), OsString::from("1")),
             (OsString::from("CARGO_INCREMENTAL"), OsString::from("0")),
-            (OsString::from("CARGO_TARGET_DIR"), target_dir.into_os_string()),
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                target_dir.into_os_string(),
+            ),
             (OsString::from("CARGO_TERM_COLOR"), OsString::from("never")),
         ])
         .collect::<Vec<_>>();
-    LocalExecutor.run_isolated_limited(&RunSpec {
-        program: OsString::from(program),
-        args: args.iter().map(|arg| OsString::from(*arg)).collect(),
-        cwd: workspace.to_owned(),
-        log_root: log_root.to_owned(),
-    }, &environment, token, policy.limits)
+    LocalExecutor.run_isolated_limited(
+        &RunSpec {
+            program: OsString::from(program),
+            args: args.iter().map(|arg| OsString::from(*arg)).collect(),
+            cwd: workspace.to_owned(),
+            log_root: log_root.to_owned(),
+        },
+        &environment,
+        token,
+        policy.limits,
+    )
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
@@ -445,7 +576,10 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
 fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
     let bytes = serde_json::to_vec(journal).map_err(io::Error::other)?;
     if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "check journal size limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "check journal size limit",
+        ));
     }
     let tmp = root.join(format!("checks-{}-{}.tmp", std::process::id(), now_ms()));
     let mut opts = OpenOptions::new();
@@ -459,7 +593,9 @@ fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
         fs::rename(&tmp, root.join("checks.json"))?;
         Ok(())
     })();
-    if result.is_err() { let _ = fs::remove_file(&tmp); }
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
     result
 }
 
@@ -469,15 +605,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     fn setup() -> (PathBuf, CheckPolicy, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "kojora-checks-{}-{}", std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            "kojora-checks-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let worktree = root.join("worktrees").join("task-1");
         fs::create_dir_all(&worktree).unwrap();
         let policy = CheckPolicy {
-            enabled: true, max_pending: 4, timeout_secs: 5,
-            limits: ProcessLimits { address_space_mib: Some(8192), cpu_seconds: Some(60) },
-            post_edit: vec![CheckKind::RustFmt], pre_merge: vec![],
+            enabled: true,
+            max_pending: 4,
+            timeout_secs: 5,
+            limits: ProcessLimits {
+                address_space_mib: Some(8192),
+                cpu_seconds: Some(60),
+            },
+            post_edit: vec![CheckKind::RustFmt],
+            pre_merge: vec![],
         };
         (root, policy, worktree)
     }
@@ -488,7 +634,8 @@ mod tests {
         policy.enabled = true;
         assert!(policy.validate().is_err());
         policy.limits = ProcessLimits {
-            address_space_mib: Some(8192), cpu_seconds: Some(60),
+            address_space_mib: Some(8192),
+            cpu_seconds: Some(60),
         };
         assert!(policy.validate().is_ok());
     }
@@ -503,24 +650,38 @@ mod tests {
             let dir = log_root.join("result");
             fs::create_dir_all(&dir)?;
             Ok(RunOutcome {
-                run_dir: dir, exit_code: Some(0), success: true,
-                cancelled: false, duration: Duration::ZERO,
-                stdout_bytes: 0, stderr_bytes: 0,
+                run_dir: dir,
+                exit_code: Some(0),
+                success: true,
+                cancelled: false,
+                duration: Duration::ZERO,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
             })
         });
-        let checks = CheckQueue::open_with_runner(root.join("checks"), policy.clone(), runner).unwrap();
-        let a = checks.enqueue(1, HookPhase::PostEdit, CheckKind::RustFmt, &worktree).unwrap();
-        let b = checks.enqueue(1, HookPhase::PostEdit, CheckKind::RustFmt, &worktree).unwrap();
+        let checks =
+            CheckQueue::open_with_runner(root.join("checks"), policy.clone(), runner).unwrap();
+        let a = checks
+            .enqueue(1, HookPhase::PostEdit, CheckKind::RustFmt, &worktree)
+            .unwrap();
+        let b = checks
+            .enqueue(1, HookPhase::PostEdit, CheckKind::RustFmt, &worktree)
+            .unwrap();
         assert_eq!(a, b);
         for _ in 0..200 {
-            if checks.snapshot().unwrap()[0].status == CheckStatus::Succeeded { break }
+            if checks.snapshot().unwrap()[0].status == CheckStatus::Succeeded {
+                break;
+            }
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(checks.snapshot().unwrap()[0].status, CheckStatus::Succeeded);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(checks);
         let reopened = CheckQueue::open(root.join("checks"), policy).unwrap();
-        assert_eq!(reopened.snapshot().unwrap()[0].status, CheckStatus::Succeeded);
+        assert_eq!(
+            reopened.snapshot().unwrap()[0].status,
+            CheckStatus::Succeeded
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -528,8 +689,12 @@ mod tests {
     fn forbids_checking_arbitrary_paths_and_disabled_recipes() {
         let (root, policy, worktree) = setup();
         let checks = CheckQueue::open(root.join("checks"), policy).unwrap();
-        assert!(checks.enqueue(2, HookPhase::Manual, CheckKind::RustFmt, &worktree).is_err());
-        assert!(checks.enqueue(1, HookPhase::PreMerge, CheckKind::RustTest, &worktree).is_err());
+        assert!(checks
+            .enqueue(2, HookPhase::Manual, CheckKind::RustFmt, &worktree)
+            .is_err());
+        assert!(checks
+            .enqueue(1, HookPhase::PreMerge, CheckKind::RustTest, &worktree)
+            .is_err());
         drop(checks);
         fs::remove_dir_all(root).unwrap();
     }

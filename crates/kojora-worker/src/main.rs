@@ -110,8 +110,10 @@ fn parse() -> io::Result<(PathBuf, ProcessLimits, Mode, AdmissionPolicy, CheckPo
     limits.validate()?;
     admission.validate()?;
     if admission.max_parallel > 1 && limits.address_space_mib.is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "parallel runs require an explicit per-process address-space ceiling"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "parallel runs require an explicit per-process address-space ceiling",
+        ));
     }
     checks.limits = limits;
     checks.validate()?;
