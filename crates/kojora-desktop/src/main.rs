@@ -482,6 +482,49 @@ impl eframe::App for DesktopApp {
     }
 }
 
+/// Use an OS-installed CJK font when available; no font files are shipped.
+fn install_cjk_fallback(ctx: &egui::Context) {
+    let mut candidates = Vec::new();
+    if let Some(custom) = std::env::var_os("KOJORA_GUI_FONT") {
+        candidates.push(PathBuf::from(custom));
+    }
+    if cfg!(target_os = "macos") {
+        candidates.extend([
+            PathBuf::from("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"),
+            PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+            PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+        ]);
+    }
+    if cfg!(target_os = "linux") {
+        candidates.extend([
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf"),
+        ]);
+    }
+    let font = candidates.into_iter().find_map(|path| {
+        let metadata = std::fs::metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > 40 * 1024 * 1024 {
+            return None;
+        }
+        std::fs::read(path).ok()
+    });
+    if let Some(font) = font {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("kojora-cjk".into(), egui::FontData::from_owned(font).into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("kojora-cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+    }
+}
+
 fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
     let color = match status {
         TaskStatus::Succeeded => COLOR_SUCCESS,
@@ -519,6 +562,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            install_cjk_fallback(&cc.egui_ctx);
             Ok(Box::new(DesktopApp::new(data_dir.clone())))
         }),
     )

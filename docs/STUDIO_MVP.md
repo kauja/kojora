@@ -75,7 +75,12 @@ controller. Default workspace builds exclude the GUI.
 - Every task creates one new Run/Session ID, but underlying Codex conversations
   are **not resumed** across prompts. Chat-like display is only a local
   history of independent one-shot tasks.
-- The GUI does not manage credentials or log users in. Profiles must be
+- Japanese text is rendered using an OS-installed CJK font when one is
+available. The app bundles no extra font files. Set
+`KOJORA_GUI_FONT=/absolute/path/to/NotoSansCJK-Regular.ttc` to override
+auto-detection if Japanese glyphs appear as boxes.
+
+The GUI does not manage credentials or log users in. Profiles must be
   initialized externally using `codex login`. Registering a Bot does not
   validate its credential profile until a task runs.
 - Do not use untrusted workspaces. Neither the prompt nor the GUI is an OS
