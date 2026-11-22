@@ -9,7 +9,7 @@ use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -200,6 +200,30 @@ pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
     Ok(())
 }
 
+/// Only trust a socket file owned by this Unix user in an owner-private
+/// directory, not a symlink or a world-accessible user-supplied endpoint.
+fn verify_private_socket(socket: &Path) -> io::Result<()> {
+    if !socket.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "worker socket path must be absolute"));
+    }
+    let parent = socket.parent().ok_or_else(||
+        io::Error::new(io::ErrorKind::InvalidInput, "worker socket has no parent"))?;
+    let directory = fs::symlink_metadata(parent)?;
+    let metadata = fs::symlink_metadata(socket)?;
+    // SAFETY: libc::geteuid queries only the effective Unix user ID.
+    let uid = unsafe { libc::geteuid() };
+    if !directory.is_dir() || directory.file_type().is_symlink()
+        || directory.uid() != uid || directory.permissions().mode() & 0o077 != 0
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "worker socket and parent directory must be private and owned by the current user"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     socket: PathBuf,
@@ -208,7 +232,9 @@ pub struct WorkerClient {
 
 impl WorkerClient {
     pub fn connect(socket: impl Into<PathBuf>) -> io::Result<Self> {
-        let mut client = Self { socket: socket.into(), data_dir: PathBuf::new() };
+        let socket = socket.into();
+        verify_private_socket(&socket)?;
+        let mut client = Self { socket, data_dir: PathBuf::new() };
         let status = client.status()?;
         if status.protocol != VERSION {
             return Err(io::Error::new(io::ErrorKind::Unsupported,
@@ -451,6 +477,21 @@ mod tests {
         second.shutdown().unwrap();
         server.join().unwrap().unwrap();
         assert!(!socket.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_public_or_symlinked_control_sockets() {
+        let root = test_root();
+        let socket = root.join("worker.sock");
+        // A regular file cannot masquerade as the worker endpoint.
+        fs::write(&socket, b"fake").unwrap();
+        assert_eq!(verify_private_socket(&socket).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied);
+        fs::remove_file(&socket).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_private_socket(&socket).is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
