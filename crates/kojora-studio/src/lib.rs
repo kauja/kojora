@@ -331,19 +331,27 @@ impl Studio {
                 }
                 let _guard = ActiveGuard(active);
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
-                let mut worktree = None;
                 let outcome = match mode {
                     AgentMode::Inspect => runner(&bot, &prompt, &task_log_root, mode),
                     AgentMode::EditWorktree => {
-                        match create_detached_worktree(&root, &bot.workspace, task_id) {
-                            Ok(path) => {
-                                worktree = Some(path.clone());
-                                let mut isolated_bot = bot.clone();
-                                isolated_bot.workspace = path;
-                                runner(&isolated_bot, &prompt, &task_log_root, mode)
+                        create_detached_worktree(&root, &bot.workspace, task_id).and_then(|path| {
+                            {
+                                let mut state = shared_state.lock().map_err(lock_error)?;
+                                let mut candidate = state.clone();
+                                let run = candidate
+                                    .runs
+                                    .iter_mut()
+                                    .find(|run| run.id == run_id)
+                                    .ok_or_else(|| {
+                                        io::Error::new(io::ErrorKind::NotFound, "run not found")
+                                    })?;
+                                run.worktree_dir = Some(path.clone());
+                                commit_state(&root, &mut state, candidate)?;
                             }
-                            Err(error) => Err(error),
-                        }
+                            let mut isolated_bot = bot;
+                            isolated_bot.workspace = path;
+                            runner(&isolated_bot, &prompt, &task_log_root, mode)
+                        })
                     }
                 };
                 let mut state = match shared_state.lock() {
@@ -372,7 +380,6 @@ impl Studio {
                     run.status = status;
                     run.exit_code = exit_code;
                     run.run_dir = run_dir;
-                    run.worktree_dir = worktree;
                     run.error = error;
                     run.finished_ms = unix_ms().ok();
                 }
@@ -900,8 +907,15 @@ mod tests {
         assert!(status.success());
 
         let studio_root = root.join("state");
-        let fake: Arc<AgentRunner> = Arc::new(|bot, _prompt, log_root, mode| {
+        let state_root = studio_root.clone();
+        let fake: Arc<AgentRunner> = Arc::new(move |bot, _prompt, log_root, mode| {
             assert_eq!(mode, AgentMode::EditWorktree);
+            let persisted = read_state(&state_root)?;
+            assert_eq!(
+                persisted.runs[0].worktree_dir.as_ref(),
+                Some(&bot.workspace)
+            );
+            assert_eq!(persisted.runs[0].status, TaskStatus::Running);
             fs::write(bot.workspace.join("file.txt"), "changed\n")?;
             let logs = log_root.join("fake-run");
             fs::create_dir_all(&logs)?;
