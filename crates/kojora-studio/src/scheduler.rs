@@ -106,8 +106,10 @@ impl Scheduler {
 
     pub fn admit(&mut self, id: u64, profile_dir: PathBuf) -> io::Result<CancellationToken> {
         if self.check_active {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "local check is running; agent must wait for the common execution slot"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "local check is running; agent must wait for the common execution slot",
+            ));
         }
         if self.tasks.len() >= self.policy.max_parallel {
             return Err(io::Error::new(

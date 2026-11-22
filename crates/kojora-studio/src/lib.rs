@@ -299,8 +299,12 @@ impl Studio {
 
     pub fn try_acquire_check_slot(&self) -> io::Result<Option<CheckPermit>> {
         let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
-        if !scheduler.try_begin_check() { return Ok(None); }
-        Ok(Some(CheckPermit { scheduler: Arc::clone(&self.scheduler) }))
+        if !scheduler.try_begin_check() {
+            return Ok(None);
+        }
+        Ok(Some(CheckPermit {
+            scheduler: Arc::clone(&self.scheduler),
+        }))
     }
 
     pub fn is_active(&self) -> bool {
