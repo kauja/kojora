@@ -5,6 +5,7 @@ use kojora_runtime::{
     CancellationToken, IsolatedExecutor, LocalExecutor, ProcessLimits, RunOutcome, RunSpec,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -186,6 +187,7 @@ pub struct CheckQueue {
     policy: CheckPolicy,
     activated_ms: u64,
     journal: Arc<Mutex<CheckJournal>>,
+    observed_post_edit: Arc<Mutex<HashSet<(u64, CheckKind)>>>,
     sender: mpsc::Sender<Job>,
 }
 
@@ -320,6 +322,7 @@ impl CheckQueue {
             policy,
             activated_ms,
             journal,
+            observed_post_edit: Arc::new(Mutex::new(HashSet::new())),
             sender,
         })
     }
@@ -474,12 +477,14 @@ impl CheckQueue {
         Ok(id)
     }
 
-    /// Consult the durable journal to avoid duplicate post-edit hooks across
-    /// UI reconnect and Worker restarts.
+    /// Schedule configured hooks for newly completed edit tasks.
     pub fn observe_post_edit(&self, studio: &crate::StudioState) {
         if self.policy.post_edit.is_empty() {
             return;
         }
+        let Ok(mut observed) = self.observed_post_edit.lock() else {
+            return;
+        };
         for task in &studio.tasks {
             if task.mode != crate::AgentMode::EditWorktree
                 || task.status != crate::TaskStatus::Succeeded
@@ -497,8 +502,16 @@ impl CheckQueue {
                 continue;
             };
             for kind in &self.policy.post_edit {
-                if let Err(error) = self.enqueue(task.id, HookPhase::PostEdit, *kind, worktree) {
-                    eprintln!("post-edit check for task {}: {error}", task.id);
+                let key = (task.id, *kind);
+                if observed.contains(&key) {
+                    continue;
+                }
+                match self.enqueue(task.id, HookPhase::PostEdit, *kind, worktree) {
+                    Ok(_) => {
+                        // Remember accepted hooks after their history records are evicted.
+                        observed.insert(key);
+                    }
+                    Err(error) => eprintln!("post-edit check for task {}: {error}", task.id),
                 }
             }
         }
@@ -846,6 +859,82 @@ mod tests {
             reopened.snapshot().unwrap()[0].status,
             CheckStatus::Succeeded
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn observer_does_not_requeue_a_post_edit_check_after_history_eviction() {
+        let (root, policy, worktree) = setup();
+        let runner: Arc<CheckRunner> =
+            Arc::new(|_, _, _, _, _| Err(io::Error::other("fake check result")));
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        let post_edit_record = CheckRecord {
+            id: 1,
+            task_id: 1,
+            hook: HookPhase::PostEdit,
+            kind: CheckKind::RustFmt,
+            status: CheckStatus::Succeeded,
+            created_ms: checks.activated_ms,
+            finished_ms: Some(checks.activated_ms),
+            run_dir: None,
+            error: None,
+        };
+        {
+            let mut journal = checks.journal.lock().unwrap();
+            journal.records.push(post_edit_record.clone());
+            journal
+                .records
+                .extend((2..=MAX_RECORDS as u64).map(|id| CheckRecord {
+                    id,
+                    hook: HookPhase::Manual,
+                    ..post_edit_record.clone()
+                }));
+            journal.next_id = MAX_RECORDS as u64 + 1;
+            persist(&checks.root, &journal).unwrap();
+        }
+        let mut state = crate::StudioState::default();
+        state.tasks.push(crate::TaskRecord {
+            id: 1,
+            bot_id: 2,
+            run_id: 3,
+            prompt: "test".into(),
+            mode: crate::AgentMode::EditWorktree,
+            status: crate::TaskStatus::Succeeded,
+            created_ms: checks.activated_ms,
+        });
+        state.runs.push(crate::RunRecord {
+            id: 3,
+            task_id: 1,
+            session_id: 4,
+            status: crate::TaskStatus::Succeeded,
+            started_ms: checks.activated_ms,
+            finished_ms: Some(checks.activated_ms),
+            exit_code: Some(0),
+            run_dir: None,
+            worktree_dir: Some(worktree.clone()),
+            error: None,
+        });
+
+        checks.observe_post_edit(&state);
+        checks
+            .enqueue(1, HookPhase::Manual, CheckKind::RustTest, &worktree)
+            .unwrap();
+        assert!(checks.snapshot().unwrap().iter().all(|r| r.id != 1));
+
+        checks.observe_post_edit(&state);
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(checks.pending_count(), 0);
+        assert!(checks
+            .snapshot()
+            .unwrap()
+            .iter()
+            .all(|r| r.hook == HookPhase::Manual));
+        drop(checks);
         fs::remove_dir_all(root).unwrap();
     }
 
