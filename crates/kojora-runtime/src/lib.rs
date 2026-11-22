@@ -36,6 +36,34 @@ impl CancellationToken {
     }
 }
 
+/// Per-process Unix RLIMIT ceilings. These are not host-wide RSS or CPU
+/// quotas: RLIMIT_AS caps virtual address space and RLIMIT_CPU caps CPU
+/// seconds per process (not summed across descendants).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessLimits {
+    pub address_space_mib: Option<u64>,
+    pub cpu_seconds: Option<u64>,
+}
+
+impl ProcessLimits {
+    pub fn validate(self) -> io::Result<()> {
+        if self.address_space_mib == Some(0) || self.cpu_seconds == Some(0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be positive"));
+        }
+        if let Some(mib) = self.address_space_mib {
+            let bytes = mib.checked_mul(1024 * 1024)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflow"))?;
+            let _: libc::rlim_t = bytes.try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memory limit too large"))?;
+        }
+        if let Some(seconds) = self.cpu_seconds {
+            let _: libc::rlim_t = seconds.try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU limit too large"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunSpec {
     /// Executable chosen explicitly by a trusted caller. Never shell-expanded.
@@ -86,6 +114,18 @@ pub trait IsolatedExecutor {
             "executor does not implement cancellable process execution",
         ))
     }
+
+    /// A worker with explicit resource ceilings must reject executors that
+    /// cannot enforce them instead of silently running without limits.
+    fn run_isolated_limited(
+        &self,
+        _spec: &RunSpec,
+        _environment: &[(OsString, OsString)],
+        _token: &CancellationToken,
+        _limits: ProcessLimits,
+    ) -> io::Result<RunOutcome> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "executor does not enforce resource limits"))
+    }
 }
 
 impl LocalExecutor {
@@ -94,7 +134,9 @@ impl LocalExecutor {
         spec: &RunSpec,
         environment: Option<&[(OsString, OsString)]>,
         cancellation: Option<&CancellationToken>,
+        limits: ProcessLimits,
     ) -> io::Result<RunOutcome> {
+        limits.validate()?;
         ensure_private_log_root(&spec.log_root)?;
         let run_dir = create_run_dir(&spec.log_root)?;
         let mut events = create_private_file(&run_dir.join("events.jsonl"))?;
@@ -117,6 +159,14 @@ impl LocalExecutor {
         if cancellation.is_some() {
             // A new process group lets cancellation reach descendants too.
             command.process_group(0);
+        }
+        #[cfg(unix)]
+        if limits.address_space_mib.is_some() || limits.cpu_seconds.is_some() {
+            // pre_exec only calls async-signal-safe setrlimit syscall(s).
+            // No allocations, mutexes or Rust runtimes are touched in child.
+            unsafe {
+                command.pre_exec(move || apply_process_limits(limits));
+            }
         }
         if let Some(variables) = environment {
             command.env_clear();
@@ -195,7 +245,7 @@ impl LocalExecutor {
 
 impl Executor for LocalExecutor {
     fn run(&self, spec: &RunSpec) -> io::Result<RunOutcome> {
-        self.execute(spec, None, None)
+        self.execute(spec, None, None, ProcessLimits::default())
     }
 }
 
@@ -205,7 +255,7 @@ impl IsolatedExecutor for LocalExecutor {
         spec: &RunSpec,
         environment: &[(OsString, OsString)],
     ) -> io::Result<RunOutcome> {
-        self.execute(spec, Some(environment), None)
+        self.execute(spec, Some(environment), None, ProcessLimits::default())
     }
 
     fn run_isolated_cancellable(
@@ -214,8 +264,41 @@ impl IsolatedExecutor for LocalExecutor {
         environment: &[(OsString, OsString)],
         token: &CancellationToken,
     ) -> io::Result<RunOutcome> {
-        self.execute(spec, Some(environment), Some(token))
+        self.execute(spec, Some(environment), Some(token), ProcessLimits::default())
     }
+
+    fn run_isolated_limited(
+        &self,
+        spec: &RunSpec,
+        environment: &[(OsString, OsString)],
+        token: &CancellationToken,
+        limits: ProcessLimits,
+    ) -> io::Result<RunOutcome> {
+        self.execute(spec, Some(environment), Some(token), limits)
+    }
+}
+
+#[cfg(unix)]
+fn apply_process_limits(limits: ProcessLimits) -> io::Result<()> {
+    // SAFETY: the pre_exec closure is entered after fork and invokes only
+    // setrlimit syscalls on primitive numeric values.
+    unsafe fn set(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> io::Result<()> {
+        let ceiling = libc::rlimit { rlim_cur: value, rlim_max: value };
+        if libc::setrlimit(resource, &ceiling) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    if let Some(mib) = limits.address_space_mib {
+        let bytes = mib * 1024 * 1024;
+        // SAFETY: validated before command construction.
+        unsafe { set(libc::RLIMIT_AS, bytes as libc::rlim_t)?; }
+    }
+    if let Some(seconds) = limits.cpu_seconds {
+        // SAFETY: validated before command construction.
+        unsafe { set(libc::RLIMIT_CPU, seconds as libc::rlim_t)?; }
+    }
+    Ok(())
 }
 
 /// Wait without blocking cancellation. On Unix, the child is started in its
@@ -490,6 +573,26 @@ mod tests {
         assert!(outcome.success);
         assert!(!outcome.cancelled);
         assert_eq!(fs::read(outcome.run_dir.join("stdout.log")).unwrap(), b"ok");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resource_limits_validate_without_executing_untrusted_code() {
+        assert!(ProcessLimits { address_space_mib: Some(0), cpu_seconds: None }.validate().is_err());
+        assert!(ProcessLimits { address_space_mib: Some(u64::MAX), cpu_seconds: None }.validate().is_err());
+        assert!(ProcessLimits { address_space_mib: Some(512), cpu_seconds: Some(10) }.validate().is_ok());
+    }
+
+    #[test]
+    fn limited_executor_still_captures_output() {
+        let root = test_root("limit");
+        let token = CancellationToken::default();
+        let outcome = LocalExecutor.run_isolated_limited(
+            &request(&root, "printf bounded"), &[], &token,
+            ProcessLimits { address_space_mib: Some(256), cpu_seconds: Some(10) },
+        ).unwrap();
+        assert!(outcome.success);
+        assert_eq!(fs::read(outcome.run_dir.join("stdout.log")).unwrap(), b"bounded");
         fs::remove_dir_all(root).unwrap();
     }
 
