@@ -36,11 +36,26 @@ pub struct WorkerStatus {
 enum Request {
     Status,
     Snapshot,
-    AddBot { name: String, workspace: PathBuf, profile_dir: PathBuf },
-    Submit { bot_id: u64, prompt: String, mode: AgentMode },
-    Cancel { task_id: u64 },
-    Log { task_id: u64, stderr: bool },
-    Diff { task_id: u64 },
+    AddBot {
+        name: String,
+        workspace: PathBuf,
+        profile_dir: PathBuf,
+    },
+    Submit {
+        bot_id: u64,
+        prompt: String,
+        mode: AgentMode,
+    },
+    Cancel {
+        task_id: u64,
+    },
+    Log {
+        task_id: u64,
+        stderr: bool,
+    },
+    Diff {
+        task_id: u64,
+    },
     Shutdown,
 }
 
@@ -82,7 +97,10 @@ fn receive<T: DeserializeOwned>(stream: &mut UnixStream, limit: usize) -> io::Re
     stream.read_exact(&mut header)?;
     let length = u32::from_be_bytes(header) as usize;
     if length == 0 || length > limit {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid IPC frame length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid IPC frame length",
+        ));
     }
     let mut frame = vec![0u8; length];
     stream.read_exact(&mut frame)?;
@@ -93,7 +111,10 @@ fn receive<T: DeserializeOwned>(stream: &mut UnixStream, limit: usize) -> io::Re
 fn transmit<T: Serialize>(stream: &mut UnixStream, message: &T, max: usize) -> io::Result<()> {
     let bytes = serde_json::to_vec(message).map_err(io::Error::other)?;
     if bytes.is_empty() || bytes.len() > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC response exceeds limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC response exceeds limit",
+        ));
     }
     let length = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "IPC frame too large"))?;
@@ -117,30 +138,45 @@ fn status(studio: &Studio, limits: ProcessLimits) -> WorkerStatus {
     }
 }
 
-fn dispatch(studio: &Studio, limits: ProcessLimits, request: Request) -> io::Result<(Response, bool)> {
+fn dispatch(
+    studio: &Studio,
+    limits: ProcessLimits,
+    request: Request,
+) -> io::Result<(Response, bool)> {
     let (response, shutdown) = match request {
         Request::Status => (Response::Status(status(studio, limits)), false),
         Request::Snapshot => (Response::Snapshot(studio.snapshot()?), false),
-        Request::AddBot { name, workspace, profile_dir } => (
-            Response::Id(studio.add_bot(&name, workspace, profile_dir)?), false
+        Request::AddBot {
+            name,
+            workspace,
+            profile_dir,
+        } => (
+            Response::Id(studio.add_bot(&name, workspace, profile_dir)?),
+            false,
         ),
-        Request::Submit { bot_id, prompt, mode } => (
-            Response::Id(studio.submit_with_mode(bot_id, &prompt, mode)?), false
+        Request::Submit {
+            bot_id,
+            prompt,
+            mode,
+        } => (
+            Response::Id(studio.submit_with_mode(bot_id, &prompt, mode)?),
+            false,
         ),
         Request::Cancel { task_id } => {
             studio.cancel_task(task_id)?;
             (Response::Ok, false)
         }
         Request::Log { task_id, stderr } => (
-            Response::Text(studio.read_log_tail(task_id, stderr)?), false
+            Response::Text(studio.read_log_tail(task_id, stderr)?),
+            false,
         ),
-        Request::Diff { task_id } => (
-            Response::Text(studio.read_worktree_diff(task_id)?), false
-        ),
+        Request::Diff { task_id } => (Response::Text(studio.read_worktree_diff(task_id)?), false),
         Request::Shutdown => {
             if studio.is_active() {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                    "worker is running an agent; cancel and wait for completion first"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "worker is running an agent; cancel and wait for completion first",
+                ));
             }
             (Response::Ok, true)
         }
@@ -155,7 +191,10 @@ fn serve_one(mut stream: UnixStream, studio: &Studio, limits: ProcessLimits) -> 
     let (response, shutdown) = match dispatch(studio, limits, request) {
         Ok(result) => result,
         Err(error) => (
-            Response::Error { kind: kind_name(error.kind()).to_owned(), message: error.to_string() },
+            Response::Error {
+                kind: kind_name(error.kind()).to_owned(),
+                message: error.to_string(),
+            },
             false,
         ),
     };
@@ -185,7 +224,11 @@ pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     let _guard = SocketGuard(socket.clone());
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    eprintln!("Kojora worker PID {} listening at {}", std::process::id(), socket.display());
+    eprintln!(
+        "Kojora worker PID {} listening at {}",
+        std::process::id(),
+        socket.display()
+    );
     for accepted in listener.incoming() {
         match accepted {
             Ok(stream) => match serve_one(stream, &studio, limits) {
@@ -204,22 +247,30 @@ pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
 /// directory, not a symlink or a world-accessible user-supplied endpoint.
 fn verify_private_socket(socket: &Path) -> io::Result<()> {
     if !socket.is_absolute() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "worker socket path must be absolute"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker socket path must be absolute",
+        ));
     }
-    let parent = socket.parent().ok_or_else(||
-        io::Error::new(io::ErrorKind::InvalidInput, "worker socket has no parent"))?;
+    let parent = socket.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "worker socket has no parent")
+    })?;
     let directory = fs::symlink_metadata(parent)?;
     let metadata = fs::symlink_metadata(socket)?;
     // SAFETY: libc::geteuid queries only the effective Unix user ID.
     let uid = unsafe { libc::geteuid() };
-    if !directory.is_dir() || directory.file_type().is_symlink()
-        || directory.uid() != uid || directory.permissions().mode() & 0o077 != 0
+    if !directory.is_dir()
+        || directory.file_type().is_symlink()
+        || directory.uid() != uid
+        || directory.permissions().mode() & 0o077 != 0
         || !metadata.file_type().is_socket()
-        || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
     {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-            "worker socket and parent directory must be private and owned by the current user"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker socket and parent directory must be private and owned by the current user",
+        ));
     }
     Ok(())
 }
@@ -234,11 +285,16 @@ impl WorkerClient {
     pub fn connect(socket: impl Into<PathBuf>) -> io::Result<Self> {
         let socket = socket.into();
         verify_private_socket(&socket)?;
-        let mut client = Self { socket, data_dir: PathBuf::new() };
+        let mut client = Self {
+            socket,
+            data_dir: PathBuf::new(),
+        };
         let status = client.status()?;
         if status.protocol != VERSION {
-            return Err(io::Error::new(io::ErrorKind::Unsupported,
-                format!("incompatible worker protocol {}", status.protocol)));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("incompatible worker protocol {}", status.protocol),
+            ));
         }
         client.data_dir = status.data_dir;
         Ok(client)
@@ -262,56 +318,88 @@ impl WorkerClient {
     pub fn status(&self) -> io::Result<WorkerStatus> {
         match self.request(Request::Status)? {
             Response::Status(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected worker status")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected worker status",
+            )),
         }
     }
 
     pub fn snapshot(&self) -> io::Result<StudioState> {
         match self.request(Request::Snapshot)? {
             Response::Snapshot(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected studio snapshot")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected studio snapshot",
+            )),
         }
     }
 
     pub fn add_bot(&self, name: &str, workspace: PathBuf, profile_dir: PathBuf) -> io::Result<u64> {
-        match self.request(Request::AddBot { name: name.to_owned(), workspace, profile_dir })? {
+        match self.request(Request::AddBot {
+            name: name.to_owned(),
+            workspace,
+            profile_dir,
+        })? {
             Response::Id(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected bot ID")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected bot ID",
+            )),
         }
     }
 
     pub fn submit_with_mode(&self, bot_id: u64, prompt: &str, mode: AgentMode) -> io::Result<u64> {
-        match self.request(Request::Submit { bot_id, prompt: prompt.to_owned(), mode })? {
+        match self.request(Request::Submit {
+            bot_id,
+            prompt: prompt.to_owned(),
+            mode,
+        })? {
             Response::Id(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected task ID")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected task ID",
+            )),
         }
     }
 
     pub fn cancel_task(&self, task_id: u64) -> io::Result<()> {
         match self.request(Request::Cancel { task_id })? {
             Response::Ok => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected cancellation acknowledgement")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected cancellation acknowledgement",
+            )),
         }
     }
 
     pub fn read_log_tail(&self, task_id: u64, stderr: bool) -> io::Result<String> {
         match self.request(Request::Log { task_id, stderr })? {
             Response::Text(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected log text")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected log text",
+            )),
         }
     }
 
     pub fn read_worktree_diff(&self, task_id: u64) -> io::Result<String> {
         match self.request(Request::Diff { task_id })? {
             Response::Text(value) => Ok(value),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected diff text")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected diff text",
+            )),
         }
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
         match self.request(Request::Shutdown)? {
             Response::Ok => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected shutdown acknowledgement")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected shutdown acknowledgement",
+            )),
         }
     }
 }
@@ -381,8 +469,9 @@ impl StudioConnection {
     pub fn cancellation_requested(&self, task_id: u64) -> bool {
         match self {
             Self::Local(value) => value.cancellation_requested(task_id),
-            Self::Worker(value) => value.status().is_ok_and(|status|
-                status.active_task == Some(task_id) && status.cancellation_requested),
+            Self::Worker(value) => value.status().is_ok_and(|status| {
+                status.active_task == Some(task_id) && status.cancellation_requested
+            }),
         }
     }
 
@@ -423,7 +512,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "kojora-worker-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -431,20 +523,26 @@ mod tests {
     }
 
     fn fake_runner() -> Arc<AgentRunner> {
-        Arc::new(|_bot: &BotRecord, prompt: &str, log_root: &Path, _mode: AgentMode, _token: &CancellationToken| {
-            let run_dir = log_root.join("fake-run");
-            fs::create_dir_all(&run_dir)?;
-            fs::write(run_dir.join("stdout.log"), format!("echo: {prompt}"))?;
-            Ok(RunOutcome {
-                run_dir,
-                success: true,
-                cancelled: false,
-                exit_code: Some(0),
-                duration: Duration::ZERO,
-                stdout_bytes: 5,
-                stderr_bytes: 0,
-            })
-        })
+        Arc::new(
+            |_bot: &BotRecord,
+             prompt: &str,
+             log_root: &Path,
+             _mode: AgentMode,
+             _token: &CancellationToken| {
+                let run_dir = log_root.join("fake-run");
+                fs::create_dir_all(&run_dir)?;
+                fs::write(run_dir.join("stdout.log"), format!("echo: {prompt}"))?;
+                Ok(RunOutcome {
+                    run_dir,
+                    success: true,
+                    cancelled: false,
+                    exit_code: Some(0),
+                    duration: Duration::ZERO,
+                    stdout_bytes: 5,
+                    stderr_bytes: 0,
+                })
+            },
+        )
     }
 
     #[test]
@@ -461,8 +559,12 @@ mod tests {
         }
         let client = WorkerClient::connect(&socket).expect("connect to daemon");
         assert_eq!(client.status().unwrap().concurrency, 1);
-        let bot = client.add_bot("A", root.join("workspace"), root.join("profile")).unwrap();
-        let task = client.submit_with_mode(bot, "Describe it", AgentMode::Inspect).unwrap();
+        let bot = client
+            .add_bot("A", root.join("workspace"), root.join("profile"))
+            .unwrap();
+        let task = client
+            .submit_with_mode(bot, "Describe it", AgentMode::Inspect)
+            .unwrap();
         drop(client); // UI can exit without interrupting the running worker.
         let second = WorkerClient::connect(&socket).unwrap();
         for _ in 0..200 {
@@ -471,8 +573,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(second.snapshot().unwrap().tasks[0].status, TaskStatus::Succeeded);
-        assert!(second.read_log_tail(task, false).unwrap().contains("Describe it"));
+        assert_eq!(
+            second.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Succeeded
+        );
+        assert!(second
+            .read_log_tail(task, false)
+            .unwrap()
+            .contains("Describe it"));
         assert!(second.cancel_task(task).is_err());
         second.shutdown().unwrap();
         server.join().unwrap().unwrap();
@@ -486,8 +594,10 @@ mod tests {
         let socket = root.join("worker.sock");
         // A regular file cannot masquerade as the worker endpoint.
         fs::write(&socket, b"fake").unwrap();
-        assert_eq!(verify_private_socket(&socket).unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            verify_private_socket(&socket).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         fs::remove_file(&socket).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(verify_private_socket(&socket).is_err());
@@ -508,7 +618,9 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut stream = UnixStream::connect(&socket).unwrap();
-        stream.write_all(&(MAX_REQUEST as u32 + 1).to_be_bytes()).unwrap();
+        stream
+            .write_all(&(MAX_REQUEST as u32 + 1).to_be_bytes())
+            .unwrap();
         drop(stream);
         WorkerClient::connect(&socket).unwrap().shutdown().unwrap();
         server.join().unwrap().unwrap();

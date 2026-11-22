@@ -453,8 +453,12 @@ mod tests {
                 log_root: &workspace.join(".kojora").join("runs"),
             },
             &token,
-            ProcessLimits { address_space_mib: Some(2048), cpu_seconds: Some(100) },
-        ).unwrap_err();
+            ProcessLimits {
+                address_space_mib: Some(2048),
+                cpu_seconds: Some(100),
+            },
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(!profile.join(".kojora-agent.lock").exists());
         fs::remove_dir_all(profile).unwrap();

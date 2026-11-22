@@ -24,7 +24,8 @@ fn worker_process_outlives_clients_and_shuts_down_cleanly() {
         .unwrap()
         .as_nanos();
     let root: PathBuf = std::env::temp_dir().join(format!(
-        "kojora-worker-process-{}-{now}", std::process::id()
+        "kojora-worker-process-{}-{now}",
+        std::process::id()
     ));
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

@@ -2,7 +2,11 @@
 //! Private Unix socket only. This is not a network service or remote worker.
 
 use kojora_runtime::ProcessLimits;
-use kojora_studio::{default_data_dir, worker::{serve, WorkerClient}, Studio};
+use kojora_studio::{
+    default_data_dir,
+    worker::{serve, WorkerClient},
+    Studio,
+};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -44,7 +48,10 @@ fn parse() -> io::Result<(PathBuf, ProcessLimits, Mode)> {
         }
     }
     if !data_dir.is_absolute() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "data directory must be absolute"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data directory must be absolute",
+        ));
     }
     limits.validate()?;
     Ok((data_dir, limits, mode))

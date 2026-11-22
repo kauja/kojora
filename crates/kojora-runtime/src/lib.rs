@@ -48,16 +48,22 @@ pub struct ProcessLimits {
 impl ProcessLimits {
     pub fn validate(self) -> io::Result<()> {
         if self.address_space_mib == Some(0) || self.cpu_seconds == Some(0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be positive"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource limits must be positive",
+            ));
         }
         if let Some(mib) = self.address_space_mib {
-            let bytes = mib.checked_mul(1024 * 1024)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflow"))?;
-            let _: libc::rlim_t = bytes.try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memory limit too large"))?;
+            let bytes = mib.checked_mul(1024 * 1024).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflow")
+            })?;
+            let _: libc::rlim_t = bytes.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "memory limit too large")
+            })?;
         }
         if let Some(seconds) = self.cpu_seconds {
-            let _: libc::rlim_t = seconds.try_into()
+            let _: libc::rlim_t = seconds
+                .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU limit too large"))?;
         }
         Ok(())
@@ -124,7 +130,10 @@ pub trait IsolatedExecutor {
         _token: &CancellationToken,
         _limits: ProcessLimits,
     ) -> io::Result<RunOutcome> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "executor does not enforce resource limits"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executor does not enforce resource limits",
+        ))
     }
 }
 
@@ -264,7 +273,12 @@ impl IsolatedExecutor for LocalExecutor {
         environment: &[(OsString, OsString)],
         token: &CancellationToken,
     ) -> io::Result<RunOutcome> {
-        self.execute(spec, Some(environment), Some(token), ProcessLimits::default())
+        self.execute(
+            spec,
+            Some(environment),
+            Some(token),
+            ProcessLimits::default(),
+        )
     }
 
     fn run_isolated_limited(
@@ -581,21 +595,46 @@ mod tests {
 
     #[test]
     fn resource_limits_validate_without_executing_untrusted_code() {
-        assert!(ProcessLimits { address_space_mib: Some(0), cpu_seconds: None }.validate().is_err());
-        assert!(ProcessLimits { address_space_mib: Some(u64::MAX), cpu_seconds: None }.validate().is_err());
-        assert!(ProcessLimits { address_space_mib: Some(512), cpu_seconds: Some(10) }.validate().is_ok());
+        assert!(ProcessLimits {
+            address_space_mib: Some(0),
+            cpu_seconds: None
+        }
+        .validate()
+        .is_err());
+        assert!(ProcessLimits {
+            address_space_mib: Some(u64::MAX),
+            cpu_seconds: None
+        }
+        .validate()
+        .is_err());
+        assert!(ProcessLimits {
+            address_space_mib: Some(512),
+            cpu_seconds: Some(10)
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
     fn limited_executor_still_captures_output() {
         let root = test_root("limit");
         let token = CancellationToken::default();
-        let outcome = LocalExecutor.run_isolated_limited(
-            &request(&root, "printf bounded"), &[], &token,
-            ProcessLimits { address_space_mib: Some(256), cpu_seconds: Some(10) },
-        ).unwrap();
+        let outcome = LocalExecutor
+            .run_isolated_limited(
+                &request(&root, "printf bounded"),
+                &[],
+                &token,
+                ProcessLimits {
+                    address_space_mib: Some(256),
+                    cpu_seconds: Some(10),
+                },
+            )
+            .unwrap();
         assert!(outcome.success);
-        assert_eq!(fs::read(outcome.run_dir.join("stdout.log")).unwrap(), b"bounded");
+        assert_eq!(
+            fs::read(outcome.run_dir.join("stdout.log")).unwrap(),
+            b"bounded"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

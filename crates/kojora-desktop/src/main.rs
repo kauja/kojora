@@ -481,7 +481,10 @@ impl DesktopApp {
     }
 
     fn composer(&mut self, ui: &mut egui::Ui) {
-        let active = self.studio.as_ref().is_some_and(StudioConnection::is_active);
+        let active = self
+            .studio
+            .as_ref()
+            .is_some_and(StudioConnection::is_active);
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
             ui.label(
@@ -536,7 +539,11 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(
-            if self.studio.as_ref().is_some_and(StudioConnection::is_active) {
+            if self
+                .studio
+                .as_ref()
+                .is_some_and(StudioConnection::is_active)
+            {
                 350
             } else {
                 1500
@@ -721,7 +728,10 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_cjk_fallback(&cc.egui_ctx);
-            Ok(Box::new(DesktopApp::new(data_dir.clone(), worker_socket.clone())))
+            Ok(Box::new(DesktopApp::new(
+                data_dir.clone(),
+                worker_socket.clone(),
+            )))
         }),
     )
 }
