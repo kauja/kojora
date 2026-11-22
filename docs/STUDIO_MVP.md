@@ -89,18 +89,33 @@ controller. Default workspace builds exclude the GUI.
 - Every task creates one new Run/Session ID, but underlying Codex conversations
   are **not resumed** across prompts. Chat-like display is only a local
   history of independent one-shot tasks.
-- Japanese text is rendered using an OS-installed CJK font when one is
-available. The app bundles no extra font files. Set
-`KOJORA_GUI_FONT=/absolute/path/to/NotoSansCJK-Regular.ttc` to override
-auto-detection if Japanese glyphs appear as boxes.
+- Japanese text uses an OS-installed CJK font when available. No fonts are
+  bundled. If glyphs render as boxes, set
+  `KOJORA_GUI_FONT=/absolute/path/to/NotoSansCJK-Regular.ttc`.
+- The GUI does not handle account sign-in. Initialize a separate private
+  profile with the official `codex login` command before using the Bot.
+- After a crash, a profile may contain a stale `.kojora-agent.lock`.
+  Symptoms include a new run failing with "file already exists". First
+  verify **no Codex process is still using that profile**. Only then remove
+  the stale lock, for example:
 
-The GUI does not manage credentials or log users in. Profiles must be
-  initialized externally using `codex login`. Registering a Bot does not
-  validate its credential profile until a task runs.
+  ```sh
+  rm "$HOME/.config/kojora/profiles/codex-primary/.kojora-agent.lock"
+  ```
+
+  Never remove this lock while a task is still running.
+- Studio's own instance lock is shared with its worker, even if the GUI
+  controller is dropped. This prevents another Studio from opening the same
+  state while a previous worker is still executing.
+- New task and bot metadata is persisted before appearing in the shared
+  in-memory state. A failed write before rename does not leave phantom
+  records. A failure to sync the directory after the rename is logged as a
+  durability warning; the new state is still published.
 - Do not use untrusted workspaces. Neither the prompt nor the GUI is an OS
   security boundary.
-- CI compiles and tests the GUI crate on Linux, but does not open a graphical
-  window or run a credentialed Codex integration test.
+- GitHub CI compiles and tests the GUI on Linux, smoke-launches it using a
+  virtual X11 display, and checks a macOS Apple Silicon build. Manual GUI
+  interaction and credentialed Codex integration tests remain outstanding.
 
 ## Architecture
 
