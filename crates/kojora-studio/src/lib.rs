@@ -179,8 +179,16 @@ impl Studio {
         root: impl Into<PathBuf>,
         limits: kojora_runtime::ProcessLimits,
     ) -> io::Result<Self> {
+        Self::open_with_limits_and_policy(root, limits, AdmissionPolicy::single())
+    }
+
+    pub fn open_with_limits_and_policy(
+        root: impl Into<PathBuf>,
+        limits: kojora_runtime::ProcessLimits,
+        policy: AdmissionPolicy,
+    ) -> io::Result<Self> {
         limits.validate()?;
-        Self::open_with_runner(
+        Self::open_with_runner_and_policy(
             root,
             Arc::new(move |bot, prompt, log_root, mode, cancellation| {
                 let request = AgentRequest {
@@ -206,6 +214,7 @@ impl Studio {
                     ),
                 }
             }),
+            policy,
         )
     }
 
