@@ -157,9 +157,11 @@ impl DesktopApp {
                     ui.label("Codex profile (absolute path)");
                     ui.text_edit_singleline(&mut self.new_profile);
                     ui.label(
-                        egui::RichText::new("Use an existing 0700 private profile, outside the workspace.")
-                            .small()
-                            .weak(),
+                        egui::RichText::new(
+                            "Use an existing 0700 private profile, outside the workspace.",
+                        )
+                        .small()
+                        .weak(),
                     );
                     if ui.button("Create bot").clicked() {
                         self.create_bot();
@@ -247,7 +249,11 @@ impl DesktopApp {
             {
                 self.history_page -= 1;
             }
-            ui.label(format!("History page {} / {}", self.history_page + 1, max_page + 1));
+            ui.label(format!(
+                "History page {} / {}",
+                self.history_page + 1,
+                max_page + 1
+            ));
             if ui
                 .add_enabled(self.history_page < max_page, egui::Button::new("Older"))
                 .clicked()
