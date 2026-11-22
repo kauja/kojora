@@ -26,8 +26,10 @@ Milestones are capability targets, not release-date promises.
 
 - [x] Per-process Unix CPU/virtual memory ceilings with single-task admission
 - [ ] Aggregate process-tree RSS/CPU telemetry and resource budgets
-- [ ] Admission control, budgets, queues and audit logs
-- [ ] Multiple agent sessions and Git worktree isolation
+- [x] Experimental task admission by parallel slots and resource reservations
+- [x] Durable serial local-check queue and operator-configured post-edit hooks
+- [ ] Shared admission and aggregate CPU/RSS budgets for agents and checks
+- [ ] Production-grade multiple agent sessions, fair queued scheduling and Git worktree isolation
 - [ ] Safe pause/resume where agent adapters support it
 - [ ] Real memory, CPU and completion-time benchmarks
 

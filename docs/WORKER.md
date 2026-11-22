@@ -48,6 +48,18 @@ process-specific memory/CPU ceilings. RLIMIT_AS can prevent a provider from
 starting if it reserves large virtual address ranges even at low RSS.
 Test values on the intended host before enabling them in production.
 
+## Centrally controlled local checks
+
+Operator CLI flags `--enable-checks`, `--post-edit-check rustfmt`,
+`--post-edit-check clippy`, `--check-timeout-seconds 300` and
+`--max-pending-checks 16` configure a private, persisted serial queue.
+Check clients can request only named built-in presets for existing detached
+task worktrees. See [Central Local Checks](LOCAL_CHECKS.md).
+
+The check queue does **not yet share a unified resource semaphore** with
+running agents; their total CPU/RSS usage is not globally enforced.
+
+
 ## Known limitations
 
 - The Worker outlives the GUI, **not** its own crash or machine reboot.

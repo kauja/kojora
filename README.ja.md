@@ -85,5 +85,24 @@ cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/koj
 Worker自体のクラッシュ復旧・孤児プロセス回収は未実装です。
 詳しくは[Worker Daemonガイド](docs/WORKER.md)をご覧ください。
 
+## 共通Lint／テストキューとHook（試験実装）
+
+複数エージェントが同時にLintやテストを乱立させないよう、Workerが検査
+ジョブを直列キューで管理します。成功した編集タスクの`post_edit` Hookで
+Rustfmt・Clippyなどを自動登録でき、同じタスクの重複検査を防ぎます。
+GUIからの手動検査や結果ログの閲覧にも対応しています。
+
+```sh
+cargo run --release -p kojora-worker -- \
+  --data-dir "$HOME/.local/state/kojora" \
+  --address-space-mib 8192 --cpu-seconds 900 \
+  --enable-checks --post-edit-check rustfmt --post-edit-check clippy
+```
+
+**信頼できるリポジトリ限定です。** Cargoのビルドスクリプトやテストは
+任意のコードを実行し得ます。仮想メモリ・CPU時間制限だけでは完全に隔離
+できません。詳しくは[共通検査キュー](docs/LOCAL_CHECKS.md)をご覧ください。
+
+
 設計への参加は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
 ライセンスは[MIT](LICENSE)です。

@@ -1,0 +1,60 @@
+# Kojora central local checks (experimental)
+
+Kojora's Worker serializes resource-limited local lint/test requests in one
+durable queue. AI agents can request **named, pre-approved** check presets;
+they cannot define arbitrary executable paths, argv, shell scripts or
+repository Git hook commands through the Worker API.
+
+## Enable manually on a trusted repository
+
+```sh
+mkdir -p "$HOME/.local/state/kojora"
+chmod 700 "$HOME/.local/state/kojora"
+cargo run --release -p kojora-worker -- \
+  --data-dir "$HOME/.local/state/kojora" \
+  --address-space-mib 8192 --cpu-seconds 900 \
+  --enable-checks \
+  --post-edit-check rustfmt \
+  --post-edit-check clippy \
+  --check-timeout-seconds 300 \
+  --max-pending-checks 16
+```
+
+The `post_edit` hook automatically queues configured checks after a
+successful isolated-edit Task. The same Task/Hook/Preset combination is
+deduplicated across GUI reconnections and Worker restarts. Manual checks
+can be repeated after they finish. `pre_merge` is explicitly triggered by
+a client; it does **not** modify GitHub branch protection or install a
+repository Git hook.
+
+## Allowlisted checks
+
+| Preset | Exact executable and arguments | Behavior |
+|---|---|---|
+| rustfmt | `cargo fmt --all -- --check` | Check formatting, no automatic edits |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | May execute build scripts/proc macros |
+| test | `cargo test --workspace` | Executes project tests |
+| ruff | `ruff check .` | Python lint |
+| biome | `biome check .` | JS/TS lint/format checking |
+
+The Worker requires check feature opt-in and explicit OS limits on CPU time
+and *virtual address space*. It refuses arbitrary target directories: only
+the registered, detached Task Worktree may be inspected. A single check
+subprocess runs at once, with bounded pending jobs (default 16),
+wall-clock timeout (default 300 seconds), private stdout/stderr logs
+and atomic check status journaling (`checks/checks.json`). On restart,
+incomplete checks are marked Interrupted rather than blindly resumed.
+
+## Security and performance limits
+
+**Not suitable for untrusted repositories.** Cargo test, plugins, build
+scripts and code-quality tools may execute code from the repository. A
+cleared environment and per-process `RLIMIT_AS`/`RLIMIT_CPU` limits do
+not constitute an OS sandbox. `RLIMIT_AS` does not bound actual physical
+RSS or total process-tree memory. Disk space is not quota-enforced, and
+the check queue still lacks *shared agent/check aggregate capacity*.
+Linux cgroups v2 and process-tree RSS/CPU tracking remain separate future
+work. Run only against projects you trust.
+
+The GUI's Run inspector lets you queue Rustfmt, Clippy and tests and
+inspect each check's bounded stdout/stderr tail.
