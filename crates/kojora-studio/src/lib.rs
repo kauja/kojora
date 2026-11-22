@@ -1,6 +1,9 @@
 //! Headless local studio control plane: durable bot/task/run records.
 //! No UI framework is used here. Execution is single-flight on purpose.
 
+#[cfg(unix)]
+pub mod worker;
+
 use fs2::FileExt;
 use kojora_agents::{
     run_agent_cancellable, run_agent_cancellable_limited, AgentRequest, CodexExecAdapter,
