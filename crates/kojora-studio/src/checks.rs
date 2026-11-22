@@ -155,6 +155,7 @@ struct Job {
 pub struct CheckQueue {
     root: PathBuf,
     policy: CheckPolicy,
+    activated_ms: u64,
     journal: Arc<Mutex<CheckJournal>>,
     sender: mpsc::Sender<Job>,
 }
@@ -202,6 +203,7 @@ impl CheckQueue {
             persist(&root, &journal)?;
         }
         let journal = Arc::new(Mutex::new(journal));
+        let activated_ms = now_ms();
         let (sender, receiver) = mpsc::channel::<Job>();
         let shared = Arc::clone(&journal);
         let worker_root = root.clone();
@@ -213,7 +215,7 @@ impl CheckQueue {
                     execute_job(&worker_root, &worker_policy, &shared, &*runner, job);
                 }
             })?;
-        Ok(Self { root, policy, journal, sender })
+        Ok(Self { root, policy, activated_ms, journal, sender })
     }
 
     /// Return a bounded tail of a check log, never the entire compiler output.
@@ -324,6 +326,8 @@ impl CheckQueue {
                 continue;
             }
             let Some(run) = studio.runs.iter().find(|r| r.task_id == task.id) else { continue };
+            // Enabling hooks never backfills the whole old Task history.
+            if run.finished_ms.unwrap_or(0) < self.activated_ms { continue; }
             let Some(worktree) = &run.worktree_dir else { continue };
             for kind in &self.policy.post_edit {
                 if let Err(error) = self.enqueue(task.id, HookPhase::PostEdit, *kind, worktree) {
@@ -406,18 +410,25 @@ fn execute_builtin(
     token: &CancellationToken, policy: &CheckPolicy,
 ) -> io::Result<RunOutcome> {
     let (program, args) = kind.command();
+    let target_dir = log_root.parent().and_then(Path::parent)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid check path"))?
+        .join("target");
+    fs::create_dir_all(&target_dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o700))?;
     let environment = ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR"]
         .into_iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
         .chain([
             (OsString::from("CARGO_BUILD_JOBS"), OsString::from("1")),
             (OsString::from("CARGO_INCREMENTAL"), OsString::from("0")),
+            (OsString::from("CARGO_TARGET_DIR"), target_dir.into_os_string()),
             (OsString::from("CARGO_TERM_COLOR"), OsString::from("never")),
         ])
         .collect::<Vec<_>>();
     LocalExecutor.run_isolated_limited(&RunSpec {
         program: OsString::from(program),
-        args: args.iter().map(OsString::from).collect(),
+        args: args.iter().map(|arg| OsString::from(*arg)).collect(),
         cwd: workspace.to_owned(),
         log_root: log_root.to_owned(),
     }, &environment, token, policy.limits)
@@ -458,7 +469,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     fn setup() -> (PathBuf, CheckPolicy, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "kojora-checks-{}-{}", std::process::id(), now_ms()
+            "kojora-checks-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         let worktree = root.join("worktrees").join("task-1");
         fs::create_dir_all(&worktree).unwrap();

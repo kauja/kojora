@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024 + 4096;
 
