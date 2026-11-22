@@ -243,29 +243,37 @@ impl CheckQueue {
         }
         let metadata = fs::symlink_metadata(&root)?;
         if !metadata.file_type().is_dir() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "checks directory must be a real private directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "checks directory must be a real private directory",
+            ));
         }
         #[cfg(unix)]
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
         {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "checks directory must belong to the current user (mode 0700)"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "checks directory must belong to the current user (mode 0700)",
+            ));
         }
         let path = root.join("checks.json");
         let mut journal: CheckJournal = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.len() > MAX_JOURNAL_BYTES {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        "checks journal must be a bounded regular file, not a symlink"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "checks journal must be a bounded regular file, not a symlink",
+                    ));
                 }
                 #[cfg(unix)]
                 if metadata.uid() != unsafe { libc::geteuid() }
                     || metadata.permissions().mode() & 0o077 != 0
                 {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                        "checks journal must belong to the current user (mode 0600)"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "checks journal must belong to the current user (mode 0600)",
+                    ));
                 }
                 let mut file = File::open(&path)?;
                 let mut data = Vec::new();
@@ -745,7 +753,10 @@ mod tests {
         fs::create_dir(&checks_root).unwrap();
         fs::set_permissions(&checks_root, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            CheckQueue::open(&checks_root, policy.clone()).err().unwrap().kind(),
+            CheckQueue::open(&checks_root, policy.clone())
+                .err()
+                .unwrap()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
@@ -754,7 +765,11 @@ mod tests {
         );
         fs::set_permissions(&checks_root, fs::Permissions::from_mode(0o700)).unwrap();
         let other = root.join("other.json");
-        fs::write(&other, serde_json::to_vec(&CheckJournal::default()).unwrap()).unwrap();
+        fs::write(
+            &other,
+            serde_json::to_vec(&CheckJournal::default()).unwrap(),
+        )
+        .unwrap();
         let journal_file = checks_root.join("checks.json");
         symlink(&other, &journal_file).unwrap();
         assert!(CheckQueue::open(&checks_root, policy.clone()).is_err());
@@ -762,7 +777,10 @@ mod tests {
         fs::write(&journal_file, fs::read(&other).unwrap()).unwrap();
         fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            CheckQueue::open(&checks_root, policy.clone()).err().unwrap().kind(),
+            CheckQueue::open(&checks_root, policy.clone())
+                .err()
+                .unwrap()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
         fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600)).unwrap();
