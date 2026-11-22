@@ -211,7 +211,7 @@ impl DesktopApp {
                 .map_or("Select a Bot", |bot| bot.name.as_str());
             ui.label(label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let active_task = self.studio.as_ref().and_then(Studio::active_task_id);
+                let active_task = self.studio.as_ref().and_then(StudioConnection::active_task_id);
                 if let (Some(studio), Some(task_id)) = (&self.studio, active_task) {
                     if studio.cancellation_requested(task_id) {
                         ui.spinner();
