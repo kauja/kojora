@@ -3,8 +3,8 @@
 **An open, lightweight, modular software factory for AI-powered development.**
 
 > **Status: pre-alpha / design and bootstrap stage.** The repository currently
-> contains an experimental Rust workspace and a minimal CLI scaffold. It does
-> **not** yet run coding agents, host bots, or provide a GUI.
+> contains an experimental Rust workspace and a single-command process runner. It does
+> **not** yet run managed coding agents, host bots, or provide a GUI.
 
 [日本語 README](README.ja.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
 
@@ -37,6 +37,7 @@ itself** through reproducible tests, profiling and human-reviewed promotion.
 ```text
 crates/
   kojora-core/      Experimental core types and scheduler policy
+  kojora-runtime/   Experimental single-command process runner
   kojora-cli/       Minimal command-line scaffold
 
 docs/
@@ -45,7 +46,7 @@ docs/
   adr/              Architecture decisions
 ```
 
-## Build the bootstrap CLI
+## Build and run the bootstrap CLI
 
 A current stable Rust toolchain is required.
 
@@ -53,9 +54,10 @@ A current stable Rust toolchain is required.
 cargo test --workspace
 cargo run -p kojora-cli -- --help
 cargo run -p kojora-cli -- doctor
+cargo run -p kojora-cli -- run -- git --version
 ```
 
-The CLI currently reports development status only. It does not launch agents.
+`run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) for usage, privacy and limitations.
 
 ## Open design questions
 

@@ -6,6 +6,7 @@ Milestones are capability targets, not release-date promises.
 
 - [x] Public-facing project vision and basic architecture sketch
 - [x] Rust workspace, minimal CLI, deterministic scheduling example
+- [x] Experimental local process runner with private logs and lifecycle events (not an agent adapter)
 - [ ] Confirm plugin boundaries with an ADR and conformance tests
 - [ ] Decide durable events, IDs and storage migration strategy
 

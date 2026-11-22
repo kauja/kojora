@@ -11,4 +11,4 @@ name = "kojora"
 path = "src/main.rs"
 
 [dependencies]
-kojora-core = { path = "../kojora-core" }
+kojora-runtime = { path = "../kojora-runtime" }
