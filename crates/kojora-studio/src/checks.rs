@@ -691,8 +691,10 @@ mod tests {
 
     #[test]
     fn validates_fail_closed_limit_configuration() {
-        let mut policy = CheckPolicy::default();
-        policy.enabled = true;
+        let mut policy = CheckPolicy {
+            enabled: true,
+            ..CheckPolicy::default()
+        };
         assert!(policy.validate().is_err());
         policy.limits = ProcessLimits {
             address_space_mib: Some(8192),
