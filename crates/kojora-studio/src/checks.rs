@@ -275,7 +275,7 @@ impl CheckQueue {
                         "checks journal must belong to the current user (mode 0600)",
                     ));
                 }
-                let mut file = File::open(&path)?;
+                let file = File::open(&path)?;
                 let mut data = Vec::new();
                 file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut data)?;
                 serde_json::from_slice(&data).map_err(io::Error::other)?
