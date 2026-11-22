@@ -1,0 +1,122 @@
+name: Guarded auto-merge
+
+# Runs from the trusted default branch; does not checkout PR code.
+on:
+  workflow_run:
+    workflows:
+      - Rust CI
+      - CodeQL
+      - Dependency Review
+    types:
+      - completed
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: guarded-auto-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge eligible PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge trusted, reviewed, non-sensitive changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+
+          # No checkout or execution of PR source code in this privileged job.
+          owner="${GH_REPO%%/*}"
+          listing="$(gh api --paginate --slurp "repos/${GH_REPO}/pulls?state=open&base=main&per_page=100")"
+          mapfile -t numbers < <(jq -r '.[][] | .number' <<< "${listing}")
+
+          for number in "${numbers[@]}"; do
+            if [[ ! "${number}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Unexpected pull request number"
+              exit 1
+            fi
+
+            pr="$(gh api "repos/${GH_REPO}/pulls/${number}")"
+            if ! jq -e \
+              --arg owner "${owner}" \
+              --arg repo "${GH_REPO}" \
+              '(.user.login == $owner)
+               and (.head.repo.full_name == $repo)
+               and (.base.ref == "main")
+               and (.state == "open")
+               and (.draft == false)' <<< "${pr}" >/dev/null; then
+              echo "PR #${number}: skip (not an owner-authored, same-repo ready PR)"
+              continue
+            fi
+
+            if jq -e '
+              (.title | ascii_downcase | (contains("[manual]") or contains("[no-automerge]")))
+              or any(.labels[]?; (.name | ascii_downcase) as $n |
+                $n == "manual-review" or $n == "no-automerge")
+            ' <<< "${pr}" >/dev/null; then
+              echo "PR #${number}: skip (manual-review opt-out)"
+              continue
+            fi
+
+            changed="$(jq -r '.changed_files' <<< "${pr}")"
+            files="$(gh api --paginate --slurp "repos/${GH_REPO}/pulls/${number}/files?per_page=100")"
+            # The GitHub files API can truncate large diffs; fail closed.
+            if ! jq -e --argjson expected "${changed}" \
+              '[.[][] | .filename] | length == $expected' <<< "${files}" >/dev/null; then
+              echo "PR #${number}: skip (file list incomplete)"
+              continue
+            fi
+
+            # Sensitive changes are never merged without a human decision.
+            # This includes changes to the auto-merge guard itself.
+            if jq -e '
+              [.[][] | .filename |
+                select(
+                  startswith(".github/")
+                  or startswith(".cargo/")
+                  or startswith("scripts/")
+                  or startswith("crates/kojora-runtime/")
+                  or . == ".gitignore"
+                  or . == ".coderabbit.yaml"
+                  or . == "LICENSE"
+                  or . == "SECURITY.md"
+                  or test("(^|/)(Cargo[.]toml|Cargo[.]lock|build[.]rs|AGENTS[.]md|CODEOWNERS)$")
+                  or test("(^|/)(auth|security|policy|permissions?|credentials?|secrets?|sandbox)(/|[._-]|$)"; "i")
+                )
+              ] | length > 0
+            ' <<< "${files}" >/dev/null; then
+              echo "PR #${number}: skip (sensitive paths require manual merge)"
+              continue
+            fi
+
+            # Detect a new push between inspecting paths and attempting merge.
+            latest="$(gh api "repos/${GH_REPO}/pulls/${number}")"
+            original_sha="$(jq -r '.head.sha' <<< "${pr}")"
+            current_sha="$(jq -r '.head.sha' <<< "${latest}")"
+            if [[ "${original_sha}" != "${current_sha}" ]]; then
+              echo "PR #${number}: skip (head changed during evaluation)"
+              continue
+            fi
+
+            # GitHub's branch ruleset is the final authority on checks/reviews.
+            if [[ "$(jq -r '.mergeable_state // "unknown"' <<< "${latest}")" != "clean" ]]; then
+              echo "PR #${number}: waiting for required checks or reviews"
+              continue
+            fi
+
+            echo "PR #${number}: attempting guarded squash merge"
+            if ! gh pr merge "${number}" --repo "${GH_REPO}" \
+              --squash --match-head-commit "${current_sha}"; then
+              echo "::warning::PR #${number}: merge failed or conditions changed"
+            fi
+          done
