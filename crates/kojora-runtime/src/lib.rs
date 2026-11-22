@@ -65,7 +65,11 @@ impl LocalExecutor {
         command
             .args(&spec.args)
             .current_dir(&spec.cwd)
-            .stdin(Stdio::inherit())
+            .stdin(if environment.is_some() {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(variables) = environment {

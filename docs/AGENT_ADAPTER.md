@@ -43,7 +43,9 @@ The adapter invokes:
 codex exec --json --sandbox read-only --ignore-user-config -- PROMPT
 ```
 
-The prompt is passed as a literal argument, not shell-evaluated. It uses
+The prompt is passed as a literal argument, not shell-evaluated. Agent stdin
+is detached (EOF) so unattended runs cannot wait for input from the parent.
+It uses
 `CODEX_HOME` and `HOME` set to the canonical private profile directory;
 the child process also receives `PATH` and optional `LANG`. **All other
 parent environment variables are cleared**, including API keys and
