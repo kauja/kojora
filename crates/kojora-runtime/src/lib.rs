@@ -57,14 +57,20 @@ impl ProcessLimits {
             let bytes = mib.checked_mul(1024 * 1024).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflow")
             })?;
-            let _: libc::rlim_t = bytes.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "memory limit too large")
-            })?;
+            if u128::from(bytes) > u128::from(libc::rlim_t::MAX) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "memory limit too large",
+                ));
+            }
         }
         if let Some(seconds) = self.cpu_seconds {
-            let _: libc::rlim_t = seconds
-                .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU limit too large"))?;
+            if u128::from(seconds) > u128::from(libc::rlim_t::MAX) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CPU limit too large",
+                ));
+            }
         }
         Ok(())
     }
