@@ -39,7 +39,9 @@ Default state path:
 The GUI supports creating/selecting named Bots with absolute workspace and
 profile paths, one-shot Codex tasks, a conversation-like view of responses
 with a persistent task list, status display, and Run/Session details with
-bounded stdout/stderr and raw JSONL inspection.
+bounded stdout/stderr and raw JSONL inspection. It defaults to read-only.
+Selecting **Allow edits in a separate Git worktree** requires an additional
+confirmation before workspace-write agent execution.
 
 ## Persistence and resource boundaries
 
@@ -69,9 +71,21 @@ controller. Default workspace builds exclude the GUI.
   Do not close Studio until the agent finishes.
 - The startup recovery flag marks unfinished tasks `Interrupted`, but
   does not locate or kill orphan processes.
-- There is no process cancellation, multi-agent scheduling, Git worktree
-  isolation, permissioned code edits, autonomous PR creation, integrated
-  terminal, or resource telemetry.
+- An optional **explicitly confirmed edit mode** can launch Codex
+  `--sandbox workspace-write` inside a newly-created detached Git worktree
+  under the private Studio state directory. It never gives write access to
+  the original checkout. The Git checkout must be trusted, have at least
+  one commit and be the exact workspace root. No git commit/push/merge is
+  performed by Studio.
+- The GUI displays the worktree path and a bounded diff of tracked files
+  along with short Git status of untracked files. **Untracked file contents
+  are not included** in this diff viewer. The worktree remains after a run;
+  review, apply or remove it manually when finished.
+- **The provider's workspace-write sandbox is not a complete security
+  boundary.** Git config, hooks/filters, provider tools and projects
+  may execute unexpected code; do not run on untrusted checkouts.
+- There is no process cancellation, multi-agent scheduling, autonomous PR
+  creation, integrated terminal, or resource telemetry.
 - Every task creates one new Run/Session ID, but underlying Codex conversations
   are **not resumed** across prompts. Chat-like display is only a local
   history of independent one-shot tasks.

@@ -68,7 +68,9 @@ cargo run -p kojora-cli -- run -- git --version
 
 The desktop is written in Rust and runs locally on macOS or Linux. It shows
 Bot conversations, Task/Run/Session IDs, run status, bounded output and a
-read-only Codex prompt composer.
+read-only Codex prompt composer. An optional explicitly confirmed edit mode
+runs Codex only in a detached Git worktree, with a bounded diff viewer.
+There is no automatic commit or push.
 
 Initialize a private Codex profile outside the project:
 

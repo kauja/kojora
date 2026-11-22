@@ -32,7 +32,8 @@ Milestones are capability targets, not release-date promises.
 
 - [x] Native Rust Bot-first Studio GUI (local read-only Codex MVP)
 - [x] Task → Run → Session identifiers with bounded live stdout/stderr viewer
-- [ ] Integrated terminal, artifact/diff browsing, process cancellation
+- [x] Opt-in isolated Git worktree edit runs and bounded diff preview (experimental)
+- [ ] Integrated terminal, artifact browsing, process cancellation
 - [ ] Remote Linux worker control from local macOS desktop
 - [ ] macOS GUI automation as a separately permissioned worker plugin
 
