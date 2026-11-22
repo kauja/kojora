@@ -17,6 +17,7 @@ struct DesktopApp {
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
+    history_page: usize,
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
@@ -41,6 +42,7 @@ impl DesktopApp {
             error,
             selected_bot: None,
             selected_task: None,
+            history_page: 0,
             adding_bot: false,
             new_bot_name: String::new(),
             new_workspace: std::env::current_dir()
@@ -73,6 +75,7 @@ impl DesktopApp {
             Ok(id) => {
                 self.selected_bot = Some(id);
                 self.selected_task = None;
+                self.history_page = 0;
                 self.adding_bot = false;
                 self.new_bot_name.clear();
                 self.notice =
@@ -121,57 +124,62 @@ impl DesktopApp {
         });
         ui.separator();
 
-        for bot in &state.bots {
-            let selected = self.selected_bot == Some(bot.id);
-            let label = format!("◉  {}", bot.name);
-            if ui.selectable_label(selected, label).clicked() {
-                self.selected_bot = Some(bot.id);
-                self.selected_task = None;
-                self.show_stderr = false;
-                self.show_raw_events = false;
-            }
-            ui.label(
-                egui::RichText::new(format!("     Codex · #{}", bot.id))
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(7.0);
-        }
+        let reserved_footer_height = 68.0;
+        let list_height = (ui.available_height() - reserved_footer_height).max(100.0);
+        egui::ScrollArea::vertical()
+            .id_salt("bot-list")
+            .max_height(list_height)
+            .show(ui, |ui| {
+                for bot in &state.bots {
+                    let selected = self.selected_bot == Some(bot.id);
+                    let label = format!("◉  {}", bot.name);
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selected_bot = Some(bot.id);
+                        self.selected_task = None;
+                        self.history_page = 0;
+                        self.show_stderr = false;
+                        self.show_raw_events = false;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("     Codex · #{}", bot.id))
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(7.0);
+                }
+                if self.adding_bot {
+                    ui.separator();
+                    ui.strong("New bot");
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut self.new_bot_name);
+                    ui.label("Workspace (absolute path)");
+                    ui.text_edit_singleline(&mut self.new_workspace);
+                    ui.label("Codex profile (absolute path)");
+                    ui.text_edit_singleline(&mut self.new_profile);
+                    ui.label(
+                        egui::RichText::new("Use an existing 0700 private profile, outside the workspace.")
+                            .small()
+                            .weak(),
+                    );
+                    if ui.button("Create bot").clicked() {
+                        self.create_bot();
+                    }
+                }
+            });
 
-        if self.adding_bot {
-            ui.separator();
-            ui.strong("New bot");
-            ui.label("Name");
-            ui.text_edit_singleline(&mut self.new_bot_name);
-            ui.label("Workspace (absolute path)");
-            ui.text_edit_singleline(&mut self.new_workspace);
-            ui.label("Codex profile (absolute path)");
-            ui.text_edit_singleline(&mut self.new_profile);
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Read-only agent · 1 active run")
+                .small()
+                .weak(),
+        );
+        if let Some(studio) = &self.studio {
             ui.label(
-                egui::RichText::new("Use an existing 0700 private profile, outside the workspace.")
+                egui::RichText::new(studio.data_dir().to_string_lossy().to_string())
                     .small()
                     .weak(),
             );
-            if ui.button("Create bot").clicked() {
-                self.create_bot();
-            }
         }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Read-only agent · 1 active run")
-                    .small()
-                    .weak(),
-            );
-            if let Some(studio) = &self.studio {
-                ui.label(
-                    egui::RichText::new(studio.data_dir().to_string_lossy().to_string())
-                        .small()
-                        .weak(),
-                );
-            }
-        });
     }
 
     fn header(&mut self, ui: &mut egui::Ui, state: &StudioState) {
@@ -230,10 +238,30 @@ impl DesktopApp {
             .filter(|task| task.bot_id == bot_id)
             .collect();
 
+        let max_page = tasks.len().saturating_sub(1) / 60;
+        self.history_page = self.history_page.min(max_page);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.history_page > 0, egui::Button::new("Newer"))
+                .clicked()
+            {
+                self.history_page -= 1;
+            }
+            ui.label(format!("History page {} / {}", self.history_page + 1, max_page + 1));
+            if ui
+                .add_enabled(self.history_page < max_page, egui::Button::new("Older"))
+                .clicked()
+            {
+                self.history_page += 1;
+            }
+        });
+        let end = tasks.len().saturating_sub(self.history_page * 60);
+        let start = end.saturating_sub(60);
+
         egui::ScrollArea::vertical()
-            .id_salt("conversation")
+            .id_salt(("conversation", self.history_page))
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
+            .stick_to_bottom(self.history_page == 0)
             .show(ui, |ui| {
                 if tasks.is_empty() {
                     ui.add_space(60.0);
@@ -242,7 +270,7 @@ impl DesktopApp {
                         ui.label("Describe what you want Codex to inspect.");
                     });
                 }
-                for task in tasks.iter().rev().take(60).rev() {
+                for task in &tasks[start..end] {
                     let selected = self.selected_task == Some(task.id);
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
