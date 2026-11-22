@@ -673,6 +673,8 @@ mod tests {
         ));
         let worktree = root.join("worktrees").join("task-1");
         fs::create_dir_all(&worktree).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let policy = CheckPolicy {
             enabled: true,
             max_pending: 4,
