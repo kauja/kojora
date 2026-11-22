@@ -3,7 +3,8 @@
 
 use eframe::egui;
 use kojora_studio::{
-    default_data_dir, extract_agent_text, AgentMode, Studio, StudioState, TaskRecord, TaskStatus,
+    default_data_dir, extract_agent_text, worker::StudioConnection, AgentMode, StudioState,
+    TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,7 +14,7 @@ const COLOR_SUCCESS: egui::Color32 = egui::Color32::from_rgb(112, 215, 160);
 const COLOR_ERROR: egui::Color32 = egui::Color32::from_rgb(250, 133, 130);
 
 struct DesktopApp {
-    studio: Option<Studio>,
+    studio: Option<StudioConnection>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
@@ -32,11 +33,15 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, socket: Option<PathBuf>) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        let (studio, error) = match Studio::open(root) {
+        let result = match socket {
+            Some(socket) => StudioConnection::connect_worker(socket),
+            None => StudioConnection::open_local(root),
+        };
+        let (studio, error) = match result {
             Ok(studio) => (Some(studio), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -476,7 +481,7 @@ impl DesktopApp {
     }
 
     fn composer(&mut self, ui: &mut egui::Ui) {
-        let active = self.studio.as_ref().is_some_and(Studio::is_active);
+        let active = self.studio.as_ref().is_some_and(StudioConnection::is_active);
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
             ui.label(
@@ -531,7 +536,7 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(
-            if self.studio.as_ref().is_some_and(Studio::is_active) {
+            if self.studio.as_ref().is_some_and(StudioConnection::is_active) {
                 350
             } else {
                 1500
@@ -669,22 +674,41 @@ fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
 }
 
 fn main() -> eframe::Result<()> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let data_dir = match args.as_slice() {
-        [_] => default_data_dir(),
-        [_, flag, path] if flag == "--data-dir" => Ok(PathBuf::from(path)),
-        _ => {
-            eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR]");
-            return Ok(());
-        }
-    };
-    let data_dir = match data_dir {
+    let mut data_dir = match default_data_dir() {
         Ok(dir) => dir,
         Err(error) => {
             eprintln!("Could not determine studio data directory: {error}");
             return Ok(());
         }
     };
+    let mut worker_socket = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--data-dir" => match args.next() {
+                Some(path) => data_dir = PathBuf::from(path),
+                None => {
+                    eprintln!("--data-dir requires an absolute directory");
+                    return Ok(());
+                }
+            },
+            "--worker-socket" => match args.next() {
+                Some(path) => worker_socket = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("--worker-socket requires an absolute socket path");
+                    return Ok(());
+                }
+            },
+            _ => {
+                eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]");
+                return Ok(());
+            }
+        }
+    }
+    if !data_dir.is_absolute() || worker_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
+        eprintln!("Data directory and worker socket paths must be absolute");
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1250.0, 800.0])
@@ -697,7 +721,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_cjk_fallback(&cc.egui_ctx);
-            Ok(Box::new(DesktopApp::new(data_dir.clone())))
+            Ok(Box::new(DesktopApp::new(data_dir.clone(), worker_socket.clone())))
         }),
     )
 }
