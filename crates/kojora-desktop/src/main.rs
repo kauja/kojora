@@ -206,10 +206,21 @@ impl DesktopApp {
                 .map_or("Select a Bot", |bot| bot.name.as_str());
             ui.label(label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let active = self.studio.as_ref().is_some_and(Studio::is_active);
-                if active {
-                    ui.spinner();
-                    ui.colored_label(COLOR_ACCENT, "Agent running");
+                let active_task = self.studio.as_ref().and_then(Studio::active_task_id);
+                if let (Some(studio), Some(task_id)) = (&self.studio, active_task) {
+                    if studio.cancellation_requested(task_id) {
+                        ui.spinner();
+                        ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}..."));
+                    } else {
+                        if ui.button(format!("Stop task #{task_id}")).clicked() {
+                            self.notice = match studio.cancel_task(task_id) {
+                                Ok(()) => format!("Cancellation requested for task #{task_id}."),
+                                Err(error) => format!("Could not stop task: {error}"),
+                            };
+                        }
+                        ui.spinner();
+                        ui.colored_label(COLOR_ACCENT, "Agent running");
+                    }
                 } else {
                     ui.colored_label(COLOR_SUCCESS, "Ready");
                 }
@@ -321,7 +332,15 @@ impl DesktopApp {
                         } else if task.status == TaskStatus::Running {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Codex is processing this task...");
+                                let stopping = self
+                                    .studio
+                                    .as_ref()
+                                    .is_some_and(|studio| studio.cancellation_requested(task.id));
+                                ui.label(if stopping {
+                                    "Stopping Codex and collecting logs..."
+                                } else {
+                                    "Codex is processing this task..."
+                                });
                             });
                         } else {
                             ui.label(
@@ -643,6 +662,7 @@ fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
     let color = match status {
         TaskStatus::Succeeded => COLOR_SUCCESS,
         TaskStatus::Running => COLOR_ACCENT,
+        TaskStatus::Cancelled => egui::Color32::GRAY,
         TaskStatus::Failed | TaskStatus::Interrupted => COLOR_ERROR,
     };
     ui.colored_label(color, status.label());
