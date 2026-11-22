@@ -207,9 +207,11 @@ mod tests {
         root
     }
 
+    type RecordedCall = (RunSpec, Vec<(OsString, OsString)>);
+
     #[derive(Default)]
     struct RecordingExecutor {
-        seen: Mutex<Option<(RunSpec, Vec<(OsString, OsString)>)>>,
+        seen: Mutex<Option<RecordedCall>>,
     }
 
     impl IsolatedExecutor for RecordingExecutor {
