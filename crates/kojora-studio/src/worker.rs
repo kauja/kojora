@@ -300,8 +300,13 @@ pub fn serve_with_checks(
     policy: CheckPolicy,
 ) -> io::Result<()> {
     limits.validate()?;
-    let checks = CheckQueue::open(studio.data_dir().join("checks"), policy)?;
     let studio = Arc::new(studio);
+    let for_checks = Arc::clone(&studio);
+    let checks = CheckQueue::open_with_admission(
+        studio.data_dir().join("checks"),
+        policy,
+        Arc::new(move || for_checks.try_acquire_check_slot()),
+    )?;
     let running = Arc::new(AtomicBool::new(true));
     let _observer = if checks.has_post_edit_hooks() {
         let check_copy = checks.clone();

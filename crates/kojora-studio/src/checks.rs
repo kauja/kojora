@@ -166,6 +166,8 @@ impl CheckPolicy {
     }
 }
 
+pub type CheckAdmission = dyn Fn() -> io::Result<Option<crate::CheckPermit>> + Send + Sync + 'static;
+
 type CheckRunner = dyn Fn(&Path, &Path, CheckKind, &CancellationToken, &CheckPolicy) -> io::Result<RunOutcome>
     + Send
     + Sync
@@ -191,10 +193,29 @@ impl CheckQueue {
         Self::open_with_runner(root, policy, Arc::new(execute_builtin))
     }
 
+    /// Coordinate check execution with agent admission: a check holds an
+    /// exclusive scheduler slot until its process has fully exited.
+    pub fn open_with_admission(
+        root: impl Into<PathBuf>,
+        policy: CheckPolicy,
+        admission: Arc<CheckAdmission>,
+    ) -> io::Result<Self> {
+        Self::open_with_runner_and_admission(root, policy, Arc::new(execute_builtin), Some(admission))
+    }
+
     fn open_with_runner(
         root: impl Into<PathBuf>,
         policy: CheckPolicy,
         runner: Arc<CheckRunner>,
+    ) -> io::Result<Self> {
+        Self::open_with_runner_and_admission(root, policy, runner, None)
+    }
+
+    fn open_with_runner_and_admission(
+        root: impl Into<PathBuf>,
+        policy: CheckPolicy,
+        runner: Arc<CheckRunner>,
+        admission: Option<Arc<CheckAdmission>>,
     ) -> io::Result<Self> {
         policy.validate()?;
         let root = root.into();
@@ -244,7 +265,10 @@ impl CheckQueue {
             .name("kojora-check-queue".to_owned())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    execute_job(&worker_root, &worker_policy, &shared, &*runner, job);
+                    execute_job(
+                        &worker_root, &worker_policy, &shared, &*runner,
+                        admission.as_deref(), job,
+                    );
                 }
             })?;
         Ok(Self {
@@ -442,8 +466,35 @@ fn execute_job(
     policy: &CheckPolicy,
     shared: &Arc<Mutex<CheckJournal>>,
     runner: &CheckRunner,
+    admission: Option<&CheckAdmission>,
     job: Job,
 ) {
+    // Common admission gate: once claimed, no new agent may launch until
+    // check completion. While agents are active, keep this check queued.
+    let _permit = if let Some(try_claim) = admission {
+        loop {
+            match try_claim() {
+                Ok(Some(permit)) => break Some(permit),
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    if let Ok(mut state) = shared.lock() {
+                        let mut proposed = state.clone();
+                        if let Some(record) = proposed.records.iter_mut().find(|r| r.id == job.id) {
+                            record.status = CheckStatus::Failed;
+                            record.error = Some(format!("check admission failed: {error}"));
+                            record.finished_ms = Some(now_ms());
+                        }
+                        if persist(root, &proposed).is_ok() {
+                            *state = proposed;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    } else {
+        None
+    };
     let mut guard = match shared.lock() {
         Ok(v) => v,
         Err(_) => return,
