@@ -113,7 +113,7 @@ pub struct Studio {
     active: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     runner: Arc<AgentRunner>,
-    _instance_lock: File,
+    _instance_lock: Arc<File>,
 }
 
 impl Studio {
@@ -151,7 +151,7 @@ impl Studio {
         lock_options.read(true).write(true).create(true);
         #[cfg(unix)]
         lock_options.mode(0o600);
-        let lock = lock_options.open(root.join("instance.lock"))?;
+        let lock = Arc::new(lock_options.open(root.join("instance.lock"))?);
         lock.try_lock_exclusive()?;
 
         let mut state = read_state(&root)?;
@@ -214,14 +214,15 @@ impl Studio {
             ));
         }
         let mut state = self.state.lock().map_err(lock_error)?;
-        let id = state.next_id()?;
-        state.bots.push(BotRecord {
+        let mut candidate = state.clone();
+        let id = candidate.next_id()?;
+        candidate.bots.push(BotRecord {
             id,
             name: name.to_owned(),
             workspace,
             profile_dir,
         });
-        persist(&self.root, &state)?;
+        commit_state(&self.root, &mut state, candidate)?;
         Ok(id)
     }
 
@@ -246,17 +247,18 @@ impl Studio {
 
         let prepared = (|| -> io::Result<(u64, u64, BotRecord)> {
             let mut state = self.state.lock().map_err(lock_error)?;
-            let bot = state
+            let mut candidate = state.clone();
+            let bot = candidate
                 .bots
                 .iter()
                 .find(|bot| bot.id == bot_id)
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bot not found"))?;
-            let task_id = state.next_id()?;
-            let run_id = state.next_id()?;
-            let session_id = state.next_id()?;
+            let task_id = candidate.next_id()?;
+            let run_id = candidate.next_id()?;
+            let session_id = candidate.next_id()?;
             let now = unix_ms()?;
-            state.tasks.push(TaskRecord {
+            candidate.tasks.push(TaskRecord {
                 id: task_id,
                 bot_id,
                 run_id,
@@ -264,7 +266,7 @@ impl Studio {
                 status: TaskStatus::Running,
                 created_ms: now,
             });
-            state.runs.push(RunRecord {
+            candidate.runs.push(RunRecord {
                 id: run_id,
                 task_id,
                 session_id,
@@ -275,7 +277,7 @@ impl Studio {
                 run_dir: None,
                 error: None,
             });
-            persist(&self.root, &state)?;
+            commit_state(&self.root, &mut state, candidate)?;
             Ok((task_id, run_id, bot))
         })();
 
@@ -288,6 +290,7 @@ impl Studio {
         };
 
         let root = self.root.clone();
+        let instance_lock = Arc::clone(&self._instance_lock);
         let shared_state = Arc::clone(&self.state);
         let active = Arc::clone(&self.active);
         let last_error = Arc::clone(&self.last_error);
@@ -296,6 +299,7 @@ impl Studio {
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
+                let _instance_lock = instance_lock;
                 struct ActiveGuard(Arc<AtomicBool>);
                 impl Drop for ActiveGuard {
                     fn drop(&mut self) {
@@ -323,17 +327,18 @@ impl Studio {
                     ),
                     Err(error) => (TaskStatus::Failed, None, None, Some(error.to_string())),
                 };
-                if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+                let mut candidate = state.clone();
+                if let Some(task) = candidate.tasks.iter_mut().find(|task| task.id == task_id) {
                     task.status = status;
                 }
-                if let Some(run) = state.runs.iter_mut().find(|run| run.id == run_id) {
+                if let Some(run) = candidate.runs.iter_mut().find(|run| run.id == run_id) {
                     run.status = status;
                     run.exit_code = exit_code;
                     run.run_dir = run_dir;
                     run.error = error;
                     run.finished_ms = unix_ms().ok();
                 }
-                if let Err(error) = persist(&root, &state) {
+                if let Err(error) = commit_state(&root, &mut state, candidate) {
                     if let Ok(mut value) = last_error.lock() {
                         *value = Some(format!("could not save completed run: {error}"));
                     }
@@ -342,15 +347,16 @@ impl Studio {
         if let Err(error) = spawn {
             self.active.store(false, Ordering::Release);
             let mut state = self.state.lock().map_err(lock_error)?;
-            if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+            let mut candidate = state.clone();
+            if let Some(task) = candidate.tasks.iter_mut().find(|task| task.id == task_id) {
                 task.status = TaskStatus::Failed;
             }
-            if let Some(run) = state.runs.iter_mut().find(|run| run.id == run_id) {
+            if let Some(run) = candidate.runs.iter_mut().find(|run| run.id == run_id) {
                 run.status = TaskStatus::Failed;
                 run.error = Some(error.to_string());
                 run.finished_ms = unix_ms().ok();
             }
-            persist(&self.root, &state)?;
+            commit_state(&self.root, &mut state, candidate)?;
             return Err(error);
         }
 
@@ -505,6 +511,14 @@ fn read_state(root: &Path) -> io::Result<StudioState> {
     Ok(state)
 }
 
+/// Publish candidate metadata only after atomic persistence succeeds.
+/// Pre-rename failures leave shared state unchanged.
+fn commit_state(root: &Path, shared: &mut StudioState, candidate: StudioState) -> io::Result<()> {
+    persist(root, &candidate)?;
+    *shared = candidate;
+    Ok(())
+}
+
 fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
@@ -523,8 +537,12 @@ fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, root.join("state.json"))?;
+        // After rename the new file is already visible. A directory sync
+        // failure must not cause a rollback to stale in-memory metadata.
         #[cfg(unix)]
-        File::open(root)?.sync_all()?;
+        if let Err(error) = File::open(root).and_then(|dir| dir.sync_all()) {
+            eprintln!("warning: studio state was replaced but directory sync failed: {error}");
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -666,6 +684,23 @@ mod tests {
     fn parses_codex_messages_without_loading_complete_logs() {
         let log = "{\"type\":\"thread.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Hello\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"text\":\"ignore\"}}\n";
         assert_eq!(extract_agent_text(log), "Hello");
+    }
+
+    #[test]
+    fn failed_persist_does_not_poison_shared_state() {
+        let root = temporary_root("rollback");
+        let mut shared = StudioState::default();
+        let mut candidate = shared.clone();
+        candidate.bots.push(BotRecord {
+            id: 1,
+            name: "X".repeat(MAX_STATE_BYTES as usize),
+            workspace: root.clone(),
+            profile_dir: root.clone(),
+        });
+        assert!(commit_state(&root, &mut shared, candidate).is_err());
+        assert!(shared.bots.is_empty());
+        assert_eq!(shared.next_id, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
