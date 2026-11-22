@@ -230,7 +230,7 @@ impl CheckQueue {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let path = root.join("checks.json");
         let mut journal: CheckJournal = if path.exists() {
-            let mut file = File::open(path)?;
+            let file = File::open(path)?;
             if file.metadata()?.len() > MAX_JOURNAL_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -538,9 +538,7 @@ fn execute_job(
 
     let (status, error, run_dir) = match outcome {
         Ok(result) => {
-            let status = if timed_out.load(Ordering::Acquire) {
-                CheckStatus::Cancelled
-            } else if result.cancelled {
+            let status = if timed_out.load(Ordering::Acquire) || result.cancelled {
                 CheckStatus::Cancelled
             } else if result.success {
                 CheckStatus::Succeeded
