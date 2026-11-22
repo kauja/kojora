@@ -2,7 +2,9 @@
 //! No UI framework is used here. Execution is single-flight on purpose.
 
 use fs2::FileExt;
-use kojora_agents::{run_agent_cancellable, AgentRequest, CodexExecAdapter, CodexWorkspaceWriteAdapter};
+use kojora_agents::{
+    run_agent_cancellable, AgentRequest, CodexExecAdapter, CodexWorkspaceWriteAdapter,
+};
 use kojora_runtime::{CancellationToken, LocalExecutor, RunOutcome};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -148,9 +150,12 @@ impl Studio {
                     log_root,
                 };
                 match mode {
-                    AgentMode::Inspect => {
-                        run_agent_cancellable(&CodexExecAdapter, &LocalExecutor, &request, cancellation)
-                    }
+                    AgentMode::Inspect => run_agent_cancellable(
+                        &CodexExecAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                    ),
                     AgentMode::EditWorktree => run_agent_cancellable(
                         &CodexWorkspaceWriteAdapter,
                         &LocalExecutor,
@@ -385,7 +390,10 @@ impl Studio {
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
                 let mut worktree = None;
                 let outcome = if cancellation.is_cancelled() {
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "task cancelled before launch"))
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "task cancelled before launch",
+                    ))
                 } else {
                     match mode {
                         AgentMode::Inspect => {
@@ -436,8 +444,7 @@ impl Studio {
                         None,
                     ),
                     Err(error) => (
-                        if cancellation.is_cancelled()
-                            && error.kind() == io::ErrorKind::Interrupted
+                        if cancellation.is_cancelled() && error.kind() == io::ErrorKind::Interrupted
                         {
                             TaskStatus::Cancelled
                         } else {
@@ -1079,11 +1086,18 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(io::Error::new(io::ErrorKind::TimedOut, "cancel not received"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cancel not received",
+            ))
         });
         let studio = Studio::open_with_runner(&root, fake).unwrap();
         let bot_id = studio
-            .add_bot("Cancelled bot", root.join("workspace"), root.join("profile"))
+            .add_bot(
+                "Cancelled bot",
+                root.join("workspace"),
+                root.join("profile"),
+            )
             .unwrap();
         let task_id = studio.submit(bot_id, "stop me").unwrap();
         assert_eq!(studio.active_task_id(), Some(task_id));
@@ -1099,11 +1113,20 @@ mod tests {
         }
         assert!(!studio.is_active());
         assert!(studio.cancel_task(task_id).is_err());
-        assert_eq!(studio.snapshot().unwrap().tasks[0].status, TaskStatus::Cancelled);
-        assert_eq!(studio.snapshot().unwrap().runs[0].status, TaskStatus::Cancelled);
+        assert_eq!(
+            studio.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            studio.snapshot().unwrap().runs[0].status,
+            TaskStatus::Cancelled
+        );
         drop(studio);
         let reopened = Studio::open_with_runner(&root, fake_runner()).unwrap();
-        assert_eq!(reopened.snapshot().unwrap().tasks[0].status, TaskStatus::Cancelled);
+        assert_eq!(
+            reopened.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Cancelled
+        );
         drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }

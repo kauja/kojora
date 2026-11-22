@@ -464,9 +464,8 @@ mod tests {
         let request = request(&root, "trap '' TERM; sleep 15 & wait");
         let copy = token.clone();
         let start = Instant::now();
-        let worker = thread::spawn(move || {
-            LocalExecutor.run_isolated_cancellable(&request, &[], &copy)
-        });
+        let worker =
+            thread::spawn(move || LocalExecutor.run_isolated_cancellable(&request, &[], &copy));
         thread::sleep(Duration::from_millis(250));
         token.cancel();
         let outcome = worker.join().unwrap().expect("cancellation result");

@@ -156,7 +156,10 @@ fn run_agent_inner<A: AgentAdapter, E: IsolatedExecutor>(
     }
 
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "task cancelled before launch"));
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "task cancelled before launch",
+        ));
     }
 
     let workspace = fs::canonicalize(request.workspace)?;
@@ -206,7 +209,10 @@ fn run_agent_inner<A: AgentAdapter, E: IsolatedExecutor>(
 
     if let Some(token) = cancellation {
         if token.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "task cancelled before launch"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "task cancelled before launch",
+            ));
         }
         executor.run_isolated_cancellable(&spec, &child_environment, token)
     } else {
