@@ -4,7 +4,8 @@
 
 #![cfg(unix)]
 
-use crate::{AgentMode, Studio, StudioState};
+use crate::{AgentMode, Studio, StudioState, TaskStatus};
+use crate::checks::{CheckKind, CheckPolicy, CheckQueue, CheckRecord, HookPhase};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -13,6 +14,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 const VERSION: u32 = 1;
 const MAX_REQUEST: usize = 64 * 1024;
@@ -28,6 +32,10 @@ pub struct WorkerStatus {
     pub address_space_mib: Option<u64>,
     pub cpu_seconds: Option<u64>,
     pub concurrency: u32,
+    pub active_count: u32,
+    pub reserved_memory_mib: u64,
+    pub checks_pending: u32,
+    pub checks_enabled: bool,
     pub last_error: Option<String>,
 }
 
@@ -36,6 +44,12 @@ pub struct WorkerStatus {
 enum Request {
     Status,
     Snapshot,
+    Checks,
+    QueueCheck {
+        task_id: u64,
+        hook: HookPhase,
+        kind: CheckKind,
+    },
     AddBot {
         name: String,
         workspace: PathBuf,
@@ -64,6 +78,7 @@ enum Request {
 enum Response {
     Status(WorkerStatus),
     Snapshot(StudioState),
+    Checks(Vec<CheckRecord>),
     Id(u64),
     Text(String),
     Ok,
@@ -123,7 +138,7 @@ fn transmit<T: Serialize>(stream: &mut UnixStream, message: &T, max: usize) -> i
     Ok(())
 }
 
-fn status(studio: &Studio, limits: ProcessLimits) -> WorkerStatus {
+fn status(studio: &Studio, limits: ProcessLimits, checks: &CheckQueue) -> WorkerStatus {
     let active_task = studio.active_task_id();
     WorkerStatus {
         protocol: VERSION,
@@ -133,7 +148,11 @@ fn status(studio: &Studio, limits: ProcessLimits) -> WorkerStatus {
         cancellation_requested: active_task.is_some_and(|id| studio.cancellation_requested(id)),
         address_space_mib: limits.address_space_mib,
         cpu_seconds: limits.cpu_seconds,
-        concurrency: 1,
+        concurrency: studio.max_parallel() as u32,
+        active_count: studio.active_task_count() as u32,
+        reserved_memory_mib: studio.reserved_memory_mib(),
+        checks_pending: checks.pending_count() as u32,
+        checks_enabled: checks.is_enabled(),
         last_error: studio.last_error(),
     }
 }
@@ -141,11 +160,27 @@ fn status(studio: &Studio, limits: ProcessLimits) -> WorkerStatus {
 fn dispatch(
     studio: &Studio,
     limits: ProcessLimits,
+    checks: &CheckQueue,
     request: Request,
 ) -> io::Result<(Response, bool)> {
     let (response, shutdown) = match request {
-        Request::Status => (Response::Status(status(studio, limits)), false),
+        Request::Status => (Response::Status(status(studio, limits, checks)), false),
         Request::Snapshot => (Response::Snapshot(studio.snapshot()?), false),
+        Request::Checks => (Response::Checks(checks.snapshot()?), false),
+        Request::QueueCheck { task_id, hook, kind } => {
+            let state = studio.snapshot()?;
+            let task = state.tasks.iter().find(|t| t.id == task_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task does not exist"))?;
+            if task.mode != AgentMode::EditWorktree || task.status == TaskStatus::Running {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                    "checks require a completed editable task worktree"));
+            }
+            let run = state.runs.iter().find(|r| r.task_id == task_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "run missing"))?;
+            let workspace = run.worktree_dir.as_ref().ok_or_else(||
+                io::Error::new(io::ErrorKind::NotFound, "task has no worktree"))?;
+            (Response::Id(checks.enqueue(task_id, hook, kind, workspace)?), false)
+        },
         Request::AddBot {
             name,
             workspace,
@@ -172,11 +207,9 @@ fn dispatch(
         ),
         Request::Diff { task_id } => (Response::Text(studio.read_worktree_diff(task_id)?), false),
         Request::Shutdown => {
-            if studio.is_active() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "worker is running an agent; cancel and wait for completion first",
-                ));
+            if studio.is_active() || checks.pending_count() != 0 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                    "worker has active tasks or checks; cancel/wait for completion"));
             }
             (Response::Ok, true)
         }
@@ -184,11 +217,16 @@ fn dispatch(
     Ok((response, shutdown))
 }
 
-fn serve_one(mut stream: UnixStream, studio: &Studio, limits: ProcessLimits) -> io::Result<bool> {
+fn serve_one(
+    mut stream: UnixStream,
+    studio: &Studio,
+    limits: ProcessLimits,
+    checks: &CheckQueue,
+) -> io::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let request: Request = receive(&mut stream, MAX_REQUEST)?;
-    let (response, shutdown) = match dispatch(studio, limits, request) {
+    let (response, shutdown) = match dispatch(studio, limits, checks, request) {
         Ok(result) => result,
         Err(error) => (
             Response::Error {
@@ -212,7 +250,47 @@ impl Drop for SocketGuard {
 /// Serves the studio on a local socket within its private data directory.
 /// The daemon is the only process that may hold the state-file lock.
 pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
+    serve_with_checks(studio, limits, CheckPolicy::default())
+}
+
+struct ObserverGuard {
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ObserverGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub fn serve_with_checks(
+    studio: Studio, limits: ProcessLimits, policy: CheckPolicy,
+) -> io::Result<()> {
     limits.validate()?;
+    let checks = CheckQueue::open(studio.data_dir().join("checks"), policy)?;
+    let studio = Arc::new(studio);
+    let running = Arc::new(AtomicBool::new(true));
+    let _observer = if checks.has_post_edit_hooks() {
+        let check_copy = checks.clone();
+        let studio_copy = Arc::clone(&studio);
+        let active = Arc::clone(&running);
+        let handle = thread::Builder::new().name("kojora-post-edit-hooks".to_owned())
+            .spawn(move || {
+                while active.load(Ordering::Acquire) {
+                    if let Ok(snapshot) = studio_copy.snapshot() {
+                        check_copy.observe_post_edit(&snapshot);
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+            })?;
+        ObserverGuard { running, handle: Some(handle) }
+    } else {
+        ObserverGuard { running, handle: None }
+    };
     // Studio::open already checked that the root is an absolute, private,
     // real directory. Do not require a canonical spelling: on macOS /var
     // commonly resolves to /private/var.
@@ -231,7 +309,7 @@ pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
     );
     for accepted in listener.incoming() {
         match accepted {
-            Ok(stream) => match serve_one(stream, &studio, limits) {
+            Ok(stream) => match serve_one(stream, &studio, limits, &checks) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(error) => eprintln!("worker client error: {error}"),
@@ -322,6 +400,20 @@ impl WorkerClient {
                 io::ErrorKind::InvalidData,
                 "expected worker status",
             )),
+        }
+    }
+
+    pub fn checks(&self) -> io::Result<Vec<CheckRecord>> {
+        match self.request(Request::Checks)? {
+            Response::Checks(value) => Ok(value),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check records")),
+        }
+    }
+
+    pub fn queue_check(&self, task_id: u64, hook: HookPhase, kind: CheckKind) -> io::Result<u64> {
+        match self.request(Request::QueueCheck { task_id, hook, kind })? {
+            Response::Id(value) => Ok(value),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check ID")),
         }
     }
 
@@ -424,6 +516,22 @@ impl StudioConnection {
         match self {
             Self::Local(value) => value.data_dir(),
             Self::Worker(value) => value.data_dir(),
+        }
+    }
+
+    pub fn checks(&self) -> io::Result<Vec<CheckRecord>> {
+        match self {
+            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
+                "local checks require a separate Worker")),
+            Self::Worker(value) => value.checks(),
+        }
+    }
+
+    pub fn queue_check(&self, task_id: u64, hook: HookPhase, kind: CheckKind) -> io::Result<u64> {
+        match self {
+            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
+                "local checks require a separate Worker")),
+            Self::Worker(value) => value.queue_check(task_id, hook, kind),
         }
     }
 

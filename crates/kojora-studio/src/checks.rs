@@ -5,7 +5,6 @@ use kojora_runtime::{
     CancellationToken, IsolatedExecutor, LocalExecutor, ProcessLimits, RunOutcome, RunSpec,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -221,6 +220,14 @@ impl CheckQueue {
         Ok(self.journal.lock().map_err(lock_error)?.records.clone())
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.policy.enabled
+    }
+
+    pub fn has_post_edit_hooks(&self) -> bool {
+        !self.policy.post_edit.is_empty()
+    }
+
     pub fn pending_count(&self) -> usize {
         self.journal.lock().map_or(0, |journal| journal.records.iter().filter(|r|
             matches!(r.status, CheckStatus::Queued | CheckStatus::Running)).count())
@@ -295,6 +302,7 @@ impl CheckQueue {
     /// Consult the durable journal to avoid duplicate post-edit hooks across
     /// UI reconnect and Worker restarts.
     pub fn observe_post_edit(&self, studio: &crate::StudioState) {
+        if self.policy.post_edit.is_empty() { return; }
         for task in &studio.tasks {
             if task.mode != crate::AgentMode::EditWorktree
                 || task.status != crate::TaskStatus::Succeeded {
