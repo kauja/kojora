@@ -625,8 +625,10 @@ mod tests {
     #[test]
     fn recovers_running_tasks_after_restart() {
         let root = temporary_root("recovery");
-        let mut state = StudioState::default();
-        state.next_id = 5;
+        let mut state = StudioState {
+            next_id: 5,
+            ..StudioState::default()
+        };
         state.tasks.push(TaskRecord {
             id: 1,
             bot_id: 2,

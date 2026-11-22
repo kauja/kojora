@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use kojora_studio::{
-    default_data_dir, extract_agent_text, BotRecord, Studio, StudioState, TaskRecord, TaskStatus,
+    default_data_dir, extract_agent_text, Studio, StudioState, TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::time::Duration;
