@@ -428,7 +428,7 @@ pub fn extract_agent_text(log: &str) -> String {
             continue;
         }
         if let Some(message) = item.get("text").and_then(|text| text.as_str()) {
-            messages.push(message);
+            messages.push(message.to_owned());
         }
     }
     messages.join("\n\n")
