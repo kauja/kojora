@@ -6,7 +6,7 @@ use kojora_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 256;
@@ -231,23 +231,49 @@ impl CheckQueue {
                 "check data root must be absolute",
             ));
         }
-        fs::create_dir_all(&root)?;
+        // Do not follow an attacker-supplied symlink or change an existing
+        // directory's permissions. The parent is the Studio-owned 0700 root.
+        let mut builder = DirBuilder::new();
         #[cfg(unix)]
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        builder.mode(0o700);
+        match builder.create(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&root)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "checks directory must be a real private directory"));
+        }
+        #[cfg(unix)]
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "checks directory must belong to the current user (mode 0700)"));
+        }
         let path = root.join("checks.json");
-        let mut journal: CheckJournal = if path.exists() {
-            let file = File::open(path)?;
-            if file.metadata()?.len() > MAX_JOURNAL_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "check journal too large",
-                ));
+        let mut journal: CheckJournal = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.len() > MAX_JOURNAL_BYTES {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        "checks journal must be a bounded regular file, not a symlink"));
+                }
+                #[cfg(unix)]
+                if metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                        "checks journal must belong to the current user (mode 0600)"));
+                }
+                let mut file = File::open(&path)?;
+                let mut data = Vec::new();
+                file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut data)?;
+                serde_json::from_slice(&data).map_err(io::Error::other)?
             }
-            let mut data = Vec::new();
-            file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut data)?;
-            serde_json::from_slice(&data).map_err(io::Error::other)?
-        } else {
-            CheckJournal::default()
+            Err(error) if error.kind() == io::ErrorKind::NotFound => CheckJournal::default(),
+            Err(error) => return Err(error),
         };
         let mut recovered = false;
         for record in &mut journal.records {
@@ -687,6 +713,63 @@ mod tests {
             pre_merge: vec![],
         };
         (root, policy, worktree)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_check_state_without_modifying_target_permissions() {
+        use std::os::unix::fs::symlink;
+        let (root, policy, _) = setup();
+        let target = root.join("other");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let checks_root = root.join("checks");
+        symlink(&target, &checks_root).unwrap();
+        assert_eq!(
+            CheckQueue::open(&checks_root, policy).err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_public_check_state_and_untrusted_journal_files() {
+        use std::os::unix::fs::symlink;
+        let (root, policy, _) = setup();
+        let checks_root = root.join("checks");
+        fs::create_dir(&checks_root).unwrap();
+        fs::set_permissions(&checks_root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            CheckQueue::open(&checks_root, policy.clone()).err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            fs::metadata(&checks_root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::set_permissions(&checks_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let other = root.join("other.json");
+        fs::write(&other, serde_json::to_vec(&CheckJournal::default()).unwrap()).unwrap();
+        let journal_file = checks_root.join("checks.json");
+        symlink(&other, &journal_file).unwrap();
+        assert!(CheckQueue::open(&checks_root, policy.clone()).is_err());
+        fs::remove_file(&journal_file).unwrap();
+        fs::write(&journal_file, fs::read(&other).unwrap()).unwrap();
+        fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            CheckQueue::open(&checks_root, policy.clone()).err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let queue = CheckQueue::open(&checks_root, policy).unwrap();
+        assert!(queue.snapshot().unwrap().is_empty());
+        drop(queue);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
