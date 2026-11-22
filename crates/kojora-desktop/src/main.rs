@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use kojora_studio::{
-    default_data_dir, extract_agent_text, Studio, StudioState, TaskRecord, TaskStatus,
+    default_data_dir, extract_agent_text, AgentMode, Studio, StudioState, TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,6 +26,9 @@ struct DesktopApp {
     notice: String,
     show_stderr: bool,
     show_raw_events: bool,
+    show_diff: bool,
+    edit_mode: bool,
+    confirm_edit: bool,
 }
 
 impl DesktopApp {
@@ -60,6 +63,9 @@ impl DesktopApp {
             notice: String::new(),
             show_stderr: false,
             show_raw_events: false,
+            show_diff: false,
+            edit_mode: false,
+            confirm_edit: false,
         }
     }
 
@@ -93,13 +99,19 @@ impl DesktopApp {
         let Some(studio) = &self.studio else {
             return;
         };
-        match studio.submit(bot_id, &self.prompt) {
+        let mode = if self.edit_mode {
+            AgentMode::EditWorktree
+        } else {
+            AgentMode::Inspect
+        };
+        match studio.submit_with_mode(bot_id, &self.prompt, mode) {
             Ok(task_id) => {
                 self.selected_task = Some(task_id);
                 self.notice = format!("Task #{task_id} started.");
                 self.prompt.clear();
                 self.show_stderr = false;
                 self.show_raw_events = false;
+                self.show_diff = false;
             }
             Err(error) => {
                 self.notice = format!("Could not launch agent: {error}");
@@ -289,6 +301,13 @@ impl DesktopApp {
                             status_label(ui, task.status);
                         });
                         ui.label(&task.prompt);
+                        if task.mode == AgentMode::EditWorktree {
+                            ui.label(
+                                egui::RichText::new("Isolated edit workspace")
+                                    .color(COLOR_ACCENT)
+                                    .small(),
+                            );
+                        }
                         let response = self
                             .studio
                             .as_ref()
@@ -359,6 +378,14 @@ impl DesktopApp {
                 ui.add_space(6.0);
                 ui.colored_label(COLOR_ERROR, error);
             }
+            if let Some(worktree) = &run.worktree_dir {
+                ui.separator();
+                ui.label("Isolated Git worktree");
+                ui.small(worktree.to_string_lossy().to_string());
+                if ui.small_button("Copy worktree path").clicked() {
+                    ui.ctx().copy_text(worktree.to_string_lossy().to_string());
+                }
+            }
             if let Some(dir) = &run.run_dir {
                 ui.separator();
                 ui.label("Run directory");
@@ -375,12 +402,22 @@ impl DesktopApp {
             ui.selectable_value(&mut self.show_stderr, true, "Stderr");
         });
         ui.checkbox(&mut self.show_raw_events, "Raw JSONL");
+        if task.mode == AgentMode::EditWorktree {
+            ui.checkbox(&mut self.show_diff, "Worktree diff");
+        } else {
+            self.show_diff = false;
+        }
         ui.separator();
 
         if let Some(studio) = &self.studio {
-            match studio.read_log_tail(task_id, self.show_stderr) {
+            let output_result = if self.show_diff {
+                studio.read_worktree_diff(task_id)
+            } else {
+                studio.read_log_tail(task_id, self.show_stderr)
+            };
+            match output_result {
                 Ok(raw) => {
-                    let output = if !self.show_stderr && !self.show_raw_events {
+                    let output = if !self.show_diff && !self.show_stderr && !self.show_raw_events {
                         let text = extract_agent_text(&raw);
                         if text.is_empty() {
                             raw
@@ -424,11 +461,25 @@ impl DesktopApp {
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
             ui.label(
-                egui::RichText::new("Read-only · non-interactive · local")
-                    .weak()
-                    .small(),
+                egui::RichText::new(if self.edit_mode {
+                    "Isolated worktree · workspace-write · opt-in"
+                } else {
+                    "Read-only · non-interactive · local"
+                })
+                .weak()
+                .small(),
             );
         });
+        ui.checkbox(
+            &mut self.edit_mode,
+            "Allow edits in a separate Git worktree",
+        );
+        if self.edit_mode {
+            ui.colored_label(
+                COLOR_ERROR,
+                "Requires a trusted Git repository. Changes stay in Studio's worktree until reviewed.",
+            );
+        }
         let edit = egui::TextEdit::multiline(&mut self.prompt)
             .hint_text("Ask Codex to inspect your project, explain an issue, or propose a plan...")
             .desired_rows(3);
@@ -443,7 +494,11 @@ impl DesktopApp {
                 || shortcut && ready)
                 && ready
             {
-                self.send_prompt();
+                if self.edit_mode {
+                    self.confirm_edit = true;
+                } else {
+                    self.send_prompt();
+                }
             }
             ui.label(egui::RichText::new("Cmd/Ctrl+Enter to send").small().weak());
             if active {
@@ -513,6 +568,31 @@ impl eframe::App for DesktopApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, &state));
+
+        if self.confirm_edit {
+            let mut open = self.confirm_edit;
+            let mut approved = false;
+            egui::Window::new("Confirm isolated edit run")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Codex may change files inside a separate detached Git worktree.");
+                    ui.label("This must be a trusted project. No automatic commit, push or merge.");
+                    ui.colored_label(
+                        COLOR_ERROR,
+                        "The workspace-write sandbox is not a complete security boundary.",
+                    );
+                    if ui.button("Confirm and run").clicked() {
+                        approved = true;
+                    }
+                });
+            self.confirm_edit = open;
+            if approved {
+                self.confirm_edit = false;
+                self.send_prompt();
+            }
+        }
     }
 }
 

@@ -71,6 +71,48 @@ impl AgentAdapter for CodexExecAdapter {
     }
 }
 
+/// Explicitly opt-in to Codex workspace-write mode. Only use this with an
+/// isolated Git worktree; the adapter itself does not enforce that boundary.
+#[derive(Debug, Default)]
+pub struct CodexWorkspaceWriteAdapter;
+
+impl AgentAdapter for CodexWorkspaceWriteAdapter {
+    fn provider(&self) -> &'static str {
+        "codex"
+    }
+
+    fn executable(&self) -> OsString {
+        OsString::from("codex")
+    }
+
+    fn arguments(&self, prompt: &str) -> Vec<OsString> {
+        [
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--ignore-user-config",
+            "--",
+            prompt,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    fn profile_variable(&self) -> &'static str {
+        "CODEX_HOME"
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            jsonl_events: true,
+            resumable: false,
+            read_only: false,
+        }
+    }
+}
+
 /// A single launch. Authentication already lives in profile_dir, not in Kojora.
 pub struct AgentRequest<'a> {
     pub prompt: &'a str,
@@ -261,6 +303,28 @@ mod tests {
                 read_only: true
             }
         );
+    }
+
+    #[test]
+    fn codex_write_mode_is_explicit_and_separate() {
+        let adapter = CodexWorkspaceWriteAdapter;
+        assert_eq!(
+            adapter.arguments("make a patch"),
+            [
+                "exec",
+                "--json",
+                "--sandbox",
+                "workspace-write",
+                "--ignore-user-config",
+                "--",
+                "make a patch",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert!(!adapter.capabilities().read_only);
+        assert_eq!(adapter.profile_variable(), "CODEX_HOME");
     }
 
     #[test]
