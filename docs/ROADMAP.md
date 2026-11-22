@@ -15,7 +15,8 @@ Milestones are capability targets, not release-date promises.
 - [x] Bootstrap Codex CLI adapter (one-shot read-only, no live credential test)
 - [ ] Validate a real provider CLI end-to-end and define permissions beyond read-only
 - [ ] Own and track process lifecycles without relying on a GUI
-- [ ] Persist task, run and session metadata and recover safely on restart
+- [x] Local durable Bot/Task/Run/Session metadata and interrupted-run markers (experimental)
+- [ ] True resumable sessions and robust crash/process reconciliation
 - [ ] Isolate provider configuration/authentication profiles
 - [ ] Expose a versioned local control API and structured event stream
 
@@ -29,8 +30,9 @@ Milestones are capability targets, not release-date promises.
 
 ## M3 — Bot-first desktop experience
 
-- [ ] Native Rust GUI showing Bot conversations
-- [ ] Drill-down: Task -> Run -> Session -> terminal/diff/artifacts
+- [x] Native Rust Bot-first Studio GUI (local read-only Codex MVP)
+- [x] Task → Run → Session identifiers with bounded live stdout/stderr viewer
+- [ ] Integrated terminal, artifact/diff browsing, process cancellation
 - [ ] Remote Linux worker control from local macOS desktop
 - [ ] macOS GUI automation as a separately permissioned worker plugin
 
