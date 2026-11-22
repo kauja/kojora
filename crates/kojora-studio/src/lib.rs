@@ -4,6 +4,7 @@
 #[cfg(unix)]
 pub mod worker;
 pub mod scheduler;
+pub mod checks;
 
 use scheduler::{AdmissionPolicy, Scheduler};
 
