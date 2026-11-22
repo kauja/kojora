@@ -56,8 +56,10 @@ Operator CLI flags `--enable-checks`, `--post-edit-check rustfmt`,
 Check clients can request only named built-in presets for existing detached
 task worktrees. See [Central Local Checks](LOCAL_CHECKS.md).
 
-The check queue does **not yet share a unified resource semaphore** with
-running agents; their total CPU/RSS usage is not globally enforced.
+The check queue and agent scheduler now **share an exclusive execution
+gate**: checks wait while agents are running, and new agents are refused
+while a check is executing. This is conservative backpressure, not an
+aggregate RSS/CPU quota, cgroup containment or fair queue scheduling.
 
 
 ## Known limitations

@@ -52,9 +52,11 @@ scripts and code-quality tools may execute code from the repository. A
 cleared environment and per-process `RLIMIT_AS`/`RLIMIT_CPU` limits do
 not constitute an OS sandbox. `RLIMIT_AS` does not bound actual physical
 RSS or total process-tree memory. Disk space is not quota-enforced, and
-the check queue still lacks *shared agent/check aggregate capacity*.
-Linux cgroups v2 and process-tree RSS/CPU tracking remain separate future
-work. Run only against projects you trust.
+checks and agents now share an **exclusive execution gate**. A check
+waits until agents finish, then blocks new agent starts until it completes.
+This prevents concurrent compiler/agent resource spikes, but is deliberately
+conservative: the memory reservation estimates still do not enforce RSS.
+Linux cgroups v2 and process-tree RSS/CPU tracking remain future work. Run only against projects you trust.
 
 The GUI's Run inspector lets you queue Rustfmt, Clippy and tests and
 inspect each check's bounded stdout/stderr tail.
