@@ -210,10 +210,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "kojora-test-{name}-{now}-{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("kojora-test-{name}-{now}-{}", std::process::id()))
     }
 
     fn request(root: &Path, script: &str) -> RunSpec {
@@ -229,7 +226,10 @@ mod tests {
     fn captures_output_and_exit_status() {
         let root = test_root("output");
         let outcome = LocalExecutor
-            .run(&request(&root, "printf 'hello'; printf 'error' >&2; exit 7"))
+            .run(&request(
+                &root,
+                "printf 'hello'; printf 'error' >&2; exit 7",
+            ))
             .expect("execution");
         assert_eq!(outcome.exit_code, Some(7));
         assert!(!outcome.success);
@@ -255,7 +255,8 @@ mod tests {
         let root = test_root("literal");
         let mut spec = request(&root, "printf '%s' \"$1\"");
         spec.args.push(OsString::from("ignored-zero"));
-        spec.args.push(OsStr::new("one; echo INJECTED").to_os_string());
+        spec.args
+            .push(OsStr::new("one; echo INJECTED").to_os_string());
         let outcome = LocalExecutor.run(&spec).expect("execution");
         assert!(outcome.success);
         assert_eq!(

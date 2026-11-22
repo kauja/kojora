@@ -31,7 +31,9 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
                 index += 2;
             }
             Some(value) if value == "--log-root" => {
-                let path = args.get(index + 1).ok_or("--log-root requires a directory")?;
+                let path = args
+                    .get(index + 1)
+                    .ok_or("--log-root requires a directory")?;
                 root = Some(PathBuf::from(path));
                 index += 2;
             }
