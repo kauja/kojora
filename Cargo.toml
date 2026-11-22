@@ -5,6 +5,17 @@ members = [
     "crates/kojora-cli",
     "crates/kojora-runtime",
     "crates/kojora-agents",
+    "crates/kojora-studio",
+    "crates/kojora-desktop",
+]
+
+# Normal headless builds must not compile the desktop renderer.
+default-members = [
+    "crates/kojora-core",
+    "crates/kojora-cli",
+    "crates/kojora-runtime",
+    "crates/kojora-agents",
+    "crates/kojora-studio",
 ]
 
 [workspace.package]
