@@ -39,8 +39,21 @@ pub trait Executor {
 #[derive(Debug, Default)]
 pub struct LocalExecutor;
 
-impl Executor for LocalExecutor {
-    fn run(&self, spec: &RunSpec) -> io::Result<RunOutcome> {
+/// Executor variant that explicitly clears inherited environment variables.
+pub trait IsolatedExecutor {
+    fn run_isolated(
+        &self,
+        spec: &RunSpec,
+        environment: &[(OsString, OsString)],
+    ) -> io::Result<RunOutcome>;
+}
+
+impl LocalExecutor {
+    fn execute(
+        &self,
+        spec: &RunSpec,
+        environment: Option<&[(OsString, OsString)]>,
+    ) -> io::Result<RunOutcome> {
         ensure_private_log_root(&spec.log_root)?;
         let run_dir = create_run_dir(&spec.log_root)?;
         let mut events = create_private_file(&run_dir.join("events.jsonl"))?;
@@ -48,14 +61,18 @@ impl Executor for LocalExecutor {
         let stderr_file = create_private_file(&run_dir.join("stderr.log"))?;
         let timestamp = unix_ms()?;
         let started = Instant::now();
-        let mut child = match Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        command
             .args(&spec.args)
             .current_dir(&spec.cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        if let Some(variables) = environment {
+            command.env_clear();
+            command.envs(variables.iter().cloned());
+        }
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 writeln!(
@@ -108,6 +125,22 @@ impl Executor for LocalExecutor {
             stdout_bytes: stdout_result?,
             stderr_bytes: stderr_result?,
         })
+    }
+}
+
+impl Executor for LocalExecutor {
+    fn run(&self, spec: &RunSpec) -> io::Result<RunOutcome> {
+        self.execute(spec, None)
+    }
+}
+
+impl IsolatedExecutor for LocalExecutor {
+    fn run_isolated(
+        &self,
+        spec: &RunSpec,
+        environment: &[(OsString, OsString)],
+    ) -> io::Result<RunOutcome> {
+        self.execute(spec, Some(environment))
     }
 }
 
@@ -273,6 +306,28 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let error = LocalExecutor.run(&request(&root, "true")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_runner_does_not_inherit_environment() {
+        let root = test_root("isolated");
+        let mut spec = request(
+            &root,
+            "printf '%s' \"${HOME:-missing}:${KOJORA_TEST_VALUE:-missing}\"",
+        );
+        spec.program = OsString::from("/bin/sh");
+        let outcome = LocalExecutor
+            .run_isolated(
+                &spec,
+                &[(OsString::from("KOJORA_TEST_VALUE"), OsString::from("present"))],
+            )
+            .expect("isolated execution");
+        assert!(outcome.success);
+        assert_eq!(
+            fs::read(outcome.run_dir.join("stdout.log")).unwrap(),
+            b"missing:present"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
