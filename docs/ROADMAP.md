@@ -12,7 +12,8 @@ Milestones are capability targets, not release-date promises.
 
 ## M1 — Headless single-host runtime
 
-- [ ] Spawn one provider CLI using an adapter with explicit permissions
+- [x] Bootstrap Codex CLI adapter (one-shot read-only, no live credential test)
+- [ ] Validate a real provider CLI end-to-end and define permissions beyond read-only
 - [ ] Own and track process lifecycles without relying on a GUI
 - [ ] Persist task, run and session metadata and recover safely on restart
 - [ ] Isolate provider configuration/authentication profiles

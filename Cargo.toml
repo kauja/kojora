@@ -4,6 +4,7 @@ members = [
     "crates/kojora-core",
     "crates/kojora-cli",
     "crates/kojora-runtime",
+    "crates/kojora-agents",
 ]
 
 [workspace.package]

@@ -38,6 +38,7 @@ itself** through reproducible tests, profiling and human-reviewed promotion.
 crates/
   kojora-core/      Experimental core types and scheduler policy
   kojora-runtime/   Experimental single-command process runner
+  kojora-agents/    Provider-neutral adapter trait and Codex CLI bootstrap
   kojora-cli/       Minimal command-line scaffold
 
 docs/
@@ -55,9 +56,11 @@ cargo test --workspace
 cargo run -p kojora-cli -- --help
 cargo run -p kojora-cli -- doctor
 cargo run -p kojora-cli -- run -- git --version
+# after a separate private Codex profile has been initialized:
+# cargo run -p kojora-cli -- agent codex --profile /absolute/private/profile -- "Summarize this repository"
 ```
 
-`run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) for usage, privacy and limitations.
+`run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) and [Codex adapter](docs/AGENT_ADAPTER.md) for usage, privacy and limitations.
 
 ## Open design questions
 

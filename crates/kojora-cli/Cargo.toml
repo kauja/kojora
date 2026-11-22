@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 kojora-runtime = { path = "../kojora-runtime" }
+kojora-agents = { path = "../kojora-agents" }
