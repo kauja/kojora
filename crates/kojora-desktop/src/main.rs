@@ -2,7 +2,9 @@
 //! The headless kojora-studio crate owns storage and execution.
 
 use eframe::egui;
-use kojora_studio::{default_data_dir, extract_agent_text, BotRecord, Studio, StudioState, TaskRecord, TaskStatus};
+use kojora_studio::{
+    default_data_dir, extract_agent_text, BotRecord, Studio, StudioState, TaskRecord, TaskStatus,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -73,7 +75,8 @@ impl DesktopApp {
                 self.selected_task = None;
                 self.adding_bot = false;
                 self.new_bot_name.clear();
-                self.notice = "Bot created. Configure an authenticated Codex profile before running.".into();
+                self.notice =
+                    "Bot created. Configure an authenticated Codex profile before running.".into();
             }
             Err(error) => self.notice = format!("Could not create bot: {error}"),
         }
@@ -104,7 +107,11 @@ impl DesktopApp {
     fn sidebar(&mut self, ui: &mut egui::Ui, state: &StudioState) {
         ui.add_space(12.0);
         ui.heading(egui::RichText::new("KOJORA").color(COLOR_ACCENT).size(22.0));
-        ui.label(egui::RichText::new("Software Factory / Local MVP").weak().small());
+        ui.label(
+            egui::RichText::new("Software Factory / Local MVP")
+                .weak()
+                .small(),
+        );
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.strong("Bots");
@@ -123,7 +130,11 @@ impl DesktopApp {
                 self.show_stderr = false;
                 self.show_raw_events = false;
             }
-            ui.label(egui::RichText::new(format!("     Codex · #{}", bot.id)).weak().small());
+            ui.label(
+                egui::RichText::new(format!("     Codex · #{}", bot.id))
+                    .weak()
+                    .small(),
+            );
             ui.add_space(7.0);
         }
 
@@ -148,7 +159,11 @@ impl DesktopApp {
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.separator();
-            ui.label(egui::RichText::new("Read-only agent · 1 active run").small().weak());
+            ui.label(
+                egui::RichText::new("Read-only agent · 1 active run")
+                    .small()
+                    .weak(),
+            );
             if let Some(studio) = &self.studio {
                 ui.label(
                     egui::RichText::new(studio.data_dir().to_string_lossy().to_string())
@@ -202,12 +217,9 @@ impl DesktopApp {
         let bot = state.bots.iter().find(|bot| bot.id == bot_id);
         if let Some(bot) = bot {
             ui.label(
-                egui::RichText::new(format!(
-                    "Workspace: {}",
-                    bot.workspace.to_string_lossy()
-                ))
-                .small()
-                .weak(),
+                egui::RichText::new(format!("Workspace: {}", bot.workspace.to_string_lossy()))
+                    .small()
+                    .weak(),
             );
         }
         ui.separator();
@@ -287,26 +299,28 @@ impl DesktopApp {
         status_label(ui, task.status);
         if let Some(run) = state.runs.iter().find(|run| run.id == task.run_id) {
             ui.add_space(8.0);
-            egui::Grid::new("run_metadata").num_columns(2).show(ui, |ui| {
-                ui.label("Bot");
-                ui.label(format!("#{}", task.bot_id));
-                ui.end_row();
-                ui.label("Run");
-                ui.label(format!("#{}", run.id));
-                ui.end_row();
-                ui.label("Session");
-                ui.label(format!("#{}", run.session_id));
-                ui.end_row();
-                ui.label("Exit code");
-                ui.label(
-                    run.exit_code
-                        .map_or_else(|| "—".to_owned(), |exit| exit.to_string()),
-                );
-                ui.end_row();
-                ui.label("Status");
-                ui.label(run.status.label());
-                ui.end_row();
-            });
+            egui::Grid::new("run_metadata")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Bot");
+                    ui.label(format!("#{}", task.bot_id));
+                    ui.end_row();
+                    ui.label("Run");
+                    ui.label(format!("#{}", run.id));
+                    ui.end_row();
+                    ui.label("Session");
+                    ui.label(format!("#{}", run.session_id));
+                    ui.end_row();
+                    ui.label("Exit code");
+                    ui.label(
+                        run.exit_code
+                            .map_or_else(|| "—".to_owned(), |exit| exit.to_string()),
+                    );
+                    ui.end_row();
+                    ui.label("Status");
+                    ui.label(run.status.label());
+                    ui.end_row();
+                });
             if let Some(error) = &run.error {
                 ui.add_space(6.0);
                 ui.colored_label(COLOR_ERROR, error);
@@ -362,14 +376,24 @@ impl DesktopApp {
             }
         }
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Only the latest 32 KiB is loaded. Logs may contain sensitive model output.").small().weak());
+        ui.label(
+            egui::RichText::new(
+                "Only the latest 32 KiB is loaded. Logs may contain sensitive model output.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     fn composer(&mut self, ui: &mut egui::Ui) {
         let active = self.studio.as_ref().is_some_and(Studio::is_active);
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
-            ui.label(egui::RichText::new("Read-only · non-interactive · local").weak().small());
+            ui.label(
+                egui::RichText::new("Read-only · non-interactive · local")
+                    .weak()
+                    .small(),
+            );
         });
         let edit = egui::TextEdit::multiline(&mut self.prompt)
             .hint_text("Ask Codex to inspect your project, explain an issue, or propose a plan...")
@@ -377,8 +401,12 @@ impl DesktopApp {
         ui.add_enabled(!active && self.selected_bot.is_some(), edit);
         ui.horizontal(|ui| {
             let ready = !active && self.selected_bot.is_some() && !self.prompt.trim().is_empty();
-            let shortcut = ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Enter));
-            if (ui.add_enabled(ready, egui::Button::new("Send task")).clicked() || shortcut && ready)
+            let shortcut =
+                ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Enter));
+            if (ui
+                .add_enabled(ready, egui::Button::new("Send task"))
+                .clicked()
+                || shortcut && ready)
                 && ready
             {
                 self.send_prompt();

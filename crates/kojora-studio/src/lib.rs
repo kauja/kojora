@@ -104,10 +104,8 @@ pub struct RunRecord {
 }
 
 /// A runner can be replaced by a credential-free fake in automated tests.
-pub type AgentRunner = dyn Fn(&BotRecord, &str, &Path) -> io::Result<RunOutcome>
-    + Send
-    + Sync
-    + 'static;
+pub type AgentRunner =
+    dyn Fn(&BotRecord, &str, &Path) -> io::Result<RunOutcome> + Send + Sync + 'static;
 
 pub struct Studio {
     root: PathBuf,
@@ -120,21 +118,27 @@ pub struct Studio {
 
 impl Studio {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::open_with_runner(root, Arc::new(|bot, prompt, log_root| {
-            run_agent(
-                &CodexExecAdapter,
-                &LocalExecutor,
-                &AgentRequest {
-                    prompt,
-                    workspace: &bot.workspace,
-                    profile_dir: &bot.profile_dir,
-                    log_root,
-                },
-            )
-        }))
+        Self::open_with_runner(
+            root,
+            Arc::new(|bot, prompt, log_root| {
+                run_agent(
+                    &CodexExecAdapter,
+                    &LocalExecutor,
+                    &AgentRequest {
+                        prompt,
+                        workspace: &bot.workspace,
+                        profile_dir: &bot.profile_dir,
+                        log_root,
+                    },
+                )
+            }),
+        )
     }
 
-    pub fn open_with_runner(root: impl Into<PathBuf>, runner: Arc<AgentRunner>) -> io::Result<Self> {
+    pub fn open_with_runner(
+        root: impl Into<PathBuf>,
+        runner: Arc<AgentRunner>,
+    ) -> io::Result<Self> {
         let root = root.into();
         if !root.is_absolute() {
             return Err(io::Error::new(
@@ -195,12 +199,7 @@ impl Studio {
         self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
-    pub fn add_bot(
-        &self,
-        name: &str,
-        workspace: PathBuf,
-        profile_dir: PathBuf,
-    ) -> io::Result<u64> {
+    pub fn add_bot(&self, name: &str, workspace: PathBuf, profile_dir: PathBuf) -> io::Result<u64> {
         let name = name.trim();
         if name.is_empty() || name.len() > 100 {
             return Err(io::Error::new(
@@ -360,11 +359,7 @@ impl Studio {
 
     /// Read only the last 32 KiB of the stdout/stderr log, never the whole log.
     pub fn read_log_tail(&self, task_id: u64, stderr: bool) -> io::Result<String> {
-        let known = self
-            .snapshot()?
-            .tasks
-            .iter()
-            .any(|task| task.id == task_id);
+        let known = self.snapshot()?.tasks.iter().any(|task| task.id == task_id);
         if !known {
             return Err(io::Error::new(io::ErrorKind::NotFound, "task not found"));
         }
@@ -407,7 +402,10 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
     })?;
     let home = PathBuf::from(home);
     if cfg!(target_os = "macos") {
-        Ok(home.join("Library").join("Application Support").join("Kojora"))
+        Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("Kojora"))
     } else {
         Ok(home.join(".local").join("state").join("kojora"))
     }
@@ -496,8 +494,8 @@ fn read_state(root: &Path) -> io::Result<StudioState> {
         ));
     }
     let bytes = fs::read(&path)?;
-    let state: StudioState =
-        serde_json::from_slice(&bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let state: StudioState = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if state.schema_version != SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -515,11 +513,7 @@ fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
             "studio state exceeds the 4 MiB metadata limit",
         ));
     }
-    let tmp = root.join(format!(
-        "state-{}-{}.tmp",
-        std::process::id(),
-        unix_ms()?
-    ));
+    let tmp = root.join(format!("state-{}-{}.tmp", std::process::id(), unix_ms()?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -610,7 +604,10 @@ mod tests {
         );
         drop(service);
         let reopened = Studio::open_with_runner(&root, fake_runner()).unwrap();
-        assert_eq!(reopened.snapshot().unwrap().tasks[0].status, TaskStatus::Succeeded);
+        assert_eq!(
+            reopened.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Succeeded
+        );
         drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
@@ -651,8 +648,14 @@ mod tests {
         });
         persist(&root, &state).unwrap();
         let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
-        assert_eq!(studio.snapshot().unwrap().tasks[0].status, TaskStatus::Interrupted);
-        assert_eq!(studio.snapshot().unwrap().runs[0].status, TaskStatus::Interrupted);
+        assert_eq!(
+            studio.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Interrupted
+        );
+        assert_eq!(
+            studio.snapshot().unwrap().runs[0].status,
+            TaskStatus::Interrupted
+        );
         drop(studio);
         fs::remove_dir_all(root).unwrap();
     }
@@ -668,7 +671,9 @@ mod tests {
         let root = temporary_root("validation");
         let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
         assert!(studio.add_bot("", root.clone(), root.clone()).is_err());
-        assert!(studio.add_bot("Bad", PathBuf::from("relative"), root.clone()).is_err());
+        assert!(studio
+            .add_bot("Bad", PathBuf::from("relative"), root.clone())
+            .is_err());
         assert!(studio.submit(123, "valid").is_err());
         let id = studio.add_bot("Good", root.clone(), root.clone()).unwrap();
         assert!(studio.submit(id, "  ").is_err());
