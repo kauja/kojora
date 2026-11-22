@@ -423,7 +423,13 @@ impl Studio {
             &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
             remaining,
         )?);
-        result.truncate(MAX_LOG_TAIL_BYTES.min(result.len()));
+        if result.len() > MAX_LOG_TAIL_BYTES {
+            let mut boundary = MAX_LOG_TAIL_BYTES;
+            while !result.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            result.truncate(boundary);
+        }
         Ok(result)
     }
 
@@ -572,17 +578,26 @@ fn run_git_limited_with_limit(
         stdout.take((limit + 1) as u64).read_to_end(&mut data)?;
         Ok(data)
     })();
-    let _ = child.kill();
-    let status = child.wait()?;
-    let mut data = output?;
+    let mut data = match output {
+        Ok(data) => data,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let truncated = data.len() > limit;
+    if truncated {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    if !truncated && !status.success() {
+        return Err(io::Error::other("Git diff/status command failed"));
+    }
     data.truncate(limit);
     let mut result = String::from_utf8_lossy(&data).into_owned();
     if truncated {
         result.push_str("\n[diff output truncated]\n");
-    } else if !status.success() && status.code().is_some() {
-        // kill may race with a naturally completed command.
-        return Err(io::Error::other("Git diff/status command failed"));
     }
     Ok(result)
 }
