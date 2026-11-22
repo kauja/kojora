@@ -9,14 +9,21 @@ use kojora_studio::{
     AgentMode, StudioState, TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 const COLOR_ACCENT: egui::Color32 = egui::Color32::from_rgb(114, 184, 255);
 const COLOR_SUCCESS: egui::Color32 = egui::Color32::from_rgb(112, 215, 160);
 const COLOR_ERROR: egui::Color32 = egui::Color32::from_rgb(250, 133, 130);
 
+enum DiffPreview {
+    Loading(mpsc::Receiver<Result<String, String>>),
+    Ready(Result<String, String>),
+}
+
 struct DesktopApp {
-    studio: Option<StudioConnection>,
+    studio: Option<Arc<StudioConnection>>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
@@ -31,6 +38,7 @@ struct DesktopApp {
     show_stderr: bool,
     show_raw_events: bool,
     show_diff: bool,
+    diff_preview: Option<(u64, DiffPreview)>,
     edit_mode: bool,
     confirm_edit: bool,
 }
@@ -45,7 +53,7 @@ impl DesktopApp {
             None => StudioConnection::open_local(root),
         };
         let (studio, error) = match result {
-            Ok(studio) => (Some(studio), None),
+            Ok(studio) => (Some(Arc::new(studio)), None),
             Err(error) => (None, Some(error.to_string())),
         };
         Self {
@@ -73,6 +81,7 @@ impl DesktopApp {
             show_stderr: false,
             show_raw_events: false,
             show_diff: false,
+            diff_preview: None,
             edit_mode: false,
             confirm_edit: false,
         }
@@ -217,7 +226,7 @@ impl DesktopApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let active_task = self
                     .studio
-                    .as_ref()
+                    .as_deref()
                     .and_then(StudioConnection::active_task_id);
                 if let (Some(studio), Some(task_id)) = (&self.studio, active_task) {
                     if studio.cancellation_requested(task_id) {
@@ -485,18 +494,24 @@ impl DesktopApp {
         }
         ui.separator();
 
+        if self.selected_check.is_none() && self.show_diff {
+            if task.status == TaskStatus::Running {
+                ui.label("The worktree diff is available after the task finishes.");
+            } else {
+                self.worktree_diff(ui, task_id);
+            }
+            return;
+        }
+
         if let Some(studio) = &self.studio {
             let output_result = if let Some(check_id) = self.selected_check {
                 studio.check_log(check_id, self.show_stderr)
-            } else if self.show_diff {
-                studio.read_worktree_diff(task_id)
             } else {
                 studio.read_log_tail(task_id, self.show_stderr)
             };
             match output_result {
                 Ok(raw) => {
                     let output = if self.selected_check.is_none()
-                        && !self.show_diff
                         && !self.show_stderr
                         && !self.show_raw_events
                     {
@@ -538,11 +553,70 @@ impl DesktopApp {
         );
     }
 
+    fn worktree_diff(&mut self, ui: &mut egui::Ui, task_id: u64) {
+        if let Some((id, DiffPreview::Loading(receiver))) = &self.diff_preview {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("Worktree diff worker stopped.".into())
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ui.spinner();
+                    return;
+                }
+            };
+            self.diff_preview = Some((*id, DiffPreview::Ready(result)));
+        }
+        if let Some((id, DiffPreview::Ready(result))) = &self.diff_preview {
+            if *id == task_id && !ui.small_button("Refresh diff").clicked() {
+                match result {
+                    Ok(output) => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("worktree_diff")
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(output).monospace())
+                                        .wrap(),
+                                );
+                            });
+                    }
+                    Err(error) => {
+                        ui.colored_label(COLOR_ERROR, error);
+                    }
+                }
+                return;
+            }
+        }
+        let Some(studio) = self.studio.clone() else {
+            return;
+        };
+        let ctx = ui.ctx().clone();
+        let (sender, receiver) = mpsc::channel();
+        let spawn = thread::Builder::new()
+            .name("kojora-worktree-diff".into())
+            .spawn(move || {
+                let result = studio
+                    .read_worktree_diff(task_id)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+                ctx.request_repaint();
+            });
+        self.diff_preview = Some((
+            task_id,
+            match spawn {
+                Ok(_) => DiffPreview::Loading(receiver),
+                Err(error) => DiffPreview::Ready(Err(error.to_string())),
+            },
+        ));
+        ui.spinner();
+        ui.ctx().request_repaint();
+    }
+
     fn composer(&mut self, ui: &mut egui::Ui) {
         let active = self
             .studio
-            .as_ref()
-            .is_some_and(StudioConnection::is_active);
+            .as_deref()
+            .is_some_and(|studio| studio.is_active());
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
             ui.label(
@@ -570,7 +644,10 @@ impl DesktopApp {
             .desired_rows(3);
         ui.add_enabled(!active && self.selected_bot.is_some(), edit);
         ui.horizontal(|ui| {
-            let ready = !active && self.selected_bot.is_some() && !self.prompt.trim().is_empty();
+            let ready = !self.confirm_edit
+                && !active
+                && self.selected_bot.is_some()
+                && !self.prompt.trim().is_empty();
             let shortcut =
                 ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Enter));
             if (ui
@@ -599,8 +676,8 @@ impl eframe::App for DesktopApp {
         ctx.request_repaint_after(Duration::from_millis(
             if self
                 .studio
-                .as_ref()
-                .is_some_and(StudioConnection::is_active)
+                .as_deref()
+                .is_some_and(|studio| studio.is_active())
             {
                 350
             } else {
@@ -639,7 +716,9 @@ impl eframe::App for DesktopApp {
             .resizable(true)
             .default_width(240.0)
             .min_width(190.0)
-            .show(ctx, |ui| self.sidebar(ui, &state));
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.sidebar(ui, &state));
+            });
 
         egui::SidePanel::right("inspector")
             .resizable(true)
@@ -652,33 +731,31 @@ impl eframe::App for DesktopApp {
             .min_height(130.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                self.composer(ui);
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui));
                 ui.add_space(7.0);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, &state));
 
         if self.confirm_edit {
-            let mut open = self.confirm_edit;
-            let mut approved = false;
-            egui::Window::new("Confirm isolated edit run")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label("Codex may change files inside a separate detached Git worktree.");
-                    ui.label("This must be a trusted project. No automatic commit, push or merge.");
-                    ui.colored_label(
-                        COLOR_ERROR,
-                        "The workspace-write sandbox is not a complete security boundary.",
-                    );
-                    if ui.button("Confirm and run").clicked() {
-                        approved = true;
-                    }
-                });
-            self.confirm_edit = open;
+            let modal = egui::Modal::new(egui::Id::new("confirm-isolated-edit")).show(ctx, |ui| {
+                ui.heading("Confirm isolated edit run");
+                ui.label("Codex may change files inside a separate detached Git worktree.");
+                ui.label("This must be a trusted project. No automatic commit, push or merge.");
+                ui.colored_label(
+                    COLOR_ERROR,
+                    "The workspace-write sandbox is not a complete security boundary.",
+                );
+                ui.horizontal(|ui| {
+                    let approved = ui.button("Confirm and run").clicked();
+                    let cancelled = ui.button("Cancel").clicked();
+                    (approved, cancelled)
+                })
+                .inner
+            });
+            let (approved, cancelled) = modal.inner;
+            self.confirm_edit = !(approved || cancelled || modal.should_close());
             if approved {
-                self.confirm_edit = false;
                 self.send_prompt();
             }
         }

@@ -77,10 +77,10 @@ controller. Default workspace builds exclude the GUI.
   does not locate or kill orphan processes.
 - An optional **explicitly confirmed edit mode** can launch Codex
   `--sandbox workspace-write` inside a newly-created detached Git worktree
-  under the private Studio state directory. It never gives write access to
-  the original checkout. The Git checkout must be trusted, have at least
-  one commit and be the exact workspace root. No git commit/push/merge is
-  performed by Studio.
+  under the private Studio state directory. The adapter excludes `/tmp` and
+  `TMPDIR` from the sandbox's additional writable roots. The Git checkout
+  must be trusted, have at least one commit and be the exact workspace root.
+  No git commit/push/merge is performed by Studio.
 - The GUI displays the worktree path and a bounded diff of tracked files
   along with short Git status of untracked files. **Untracked file contents
   are not included** in this diff viewer. The worktree remains after a run;
