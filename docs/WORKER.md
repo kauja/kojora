@@ -24,10 +24,11 @@ the legacy standalone GUI default is a different state directory.
 - Only a private owner-only Unix-domain socket in a 0700 Studio directory.
 - The socket uses mode 0600; the client verifies socket and parent owner,
   type, and permissions before connecting. No TCP port or remote access.
-- Protocol v1 uses length-prefixed JSON frames with a 64-KiB request cap
+- Protocol v2 uses length-prefixed JSON frames with a 64-KiB request cap
   and explicit bounded replies. It carries no OAuth tokens or API keys.
 - RPC operations: status, snapshot, Bot creation, Task submission, Task
-  cancellation, bounded stdout/stderr logs, bounded worktree diff, shutdown.
+  cancellation, bounded stdout/stderr logs, bounded worktree diff,
+  named local-check enqueue/status/log queries, shutdown.
 - IPC callers are trusted processes running as the **same OS user**.
   This is not a security barrier between applications sharing that user.
 - The Worker holds the state lock; the GUI must not open that same state
