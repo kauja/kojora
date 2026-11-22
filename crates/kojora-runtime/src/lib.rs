@@ -320,7 +320,10 @@ mod tests {
         let outcome = LocalExecutor
             .run_isolated(
                 &spec,
-                &[(OsString::from("KOJORA_TEST_VALUE"), OsString::from("present"))],
+                &[(
+                    OsString::from("KOJORA_TEST_VALUE"),
+                    OsString::from("present"),
+                )],
             )
             .expect("isolated execution");
         assert!(outcome.success);

@@ -199,10 +199,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = env::temp_dir().join(format!(
-            "kojora-agent-{name}-{now}-{}",
-            std::process::id()
-        ));
+        let root =
+            env::temp_dir().join(format!("kojora-agent-{name}-{now}-{}", std::process::id()));
         fs::create_dir(&root).expect("create private profile directory");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .expect("set private profile permissions");
@@ -240,10 +238,18 @@ mod tests {
         assert_eq!(adapter.profile_variable(), "CODEX_HOME");
         assert_eq!(
             adapter.arguments("-prompt with spaces"),
-            ["exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--", "-prompt with spaces"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
+            [
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--ignore-user-config",
+                "--",
+                "-prompt with spaces",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             adapter.capabilities(),

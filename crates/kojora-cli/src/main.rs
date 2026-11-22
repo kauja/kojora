@@ -121,9 +121,7 @@ fn agent(args: &[OsString]) -> Result<ExitCode, String> {
     if args.len() != index + 1 {
         return Err("quote the entire prompt as one argument".to_owned());
     }
-    let prompt = prompt
-        .to_str()
-        .ok_or("agent prompt must be valid UTF-8")?;
+    let prompt = prompt.to_str().ok_or("agent prompt must be valid UTF-8")?;
     let root = log_root.unwrap_or_else(|| cwd.join(".kojora").join("runs"));
 
     let outcome = run_agent(
