@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+**/auth.json
+**/credentials.json
+**/session-token*
+**/.claude/
+**/.codex/

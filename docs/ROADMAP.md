@@ -1,0 +1,47 @@
+# Roadmap (living document)
+
+Milestones are capability targets, not release-date promises.
+
+## Bootstrap (current)
+
+- [x] Public-facing project vision and basic architecture sketch
+- [x] Rust workspace, minimal CLI, deterministic scheduling example
+- [ ] Confirm plugin boundaries with an ADR and conformance tests
+- [ ] Decide durable events, IDs and storage migration strategy
+
+## M1 — Headless single-host runtime
+
+- [ ] Spawn one provider CLI using an adapter with explicit permissions
+- [ ] Own and track process lifecycles without relying on a GUI
+- [ ] Persist task, run and session metadata and recover safely on restart
+- [ ] Isolate provider configuration/authentication profiles
+- [ ] Expose a versioned local control API and structured event stream
+
+## M2 — Resource-aware orchestration
+
+- [ ] Host process-tree memory, CPU and pressure telemetry
+- [ ] Admission control, budgets, queues and audit logs
+- [ ] Multiple agent sessions and Git worktree isolation
+- [ ] Safe pause/resume where agent adapters support it
+- [ ] Real memory, CPU and completion-time benchmarks
+
+## M3 — Bot-first desktop experience
+
+- [ ] Native Rust GUI showing Bot conversations
+- [ ] Drill-down: Task -> Run -> Session -> terminal/diff/artifacts
+- [ ] Remote Linux worker control from local macOS desktop
+- [ ] macOS GUI automation as a separately permissioned worker plugin
+
+## M4 — Plugin ecosystem
+
+- [ ] Versioned contracts for scheduler, executor, validator, storage and tools
+- [ ] Rust/WASM/IPC extension strategy with conformance suites
+- [ ] Fine-grained plugin permissions and reliable installation/removal
+- [ ] Bundled optional skills for planning, testing and performance
+
+## M5 — Verified self-improvement
+
+- [ ] Automated reproducible performance regression detection
+- [ ] Issue -> proposal -> isolated implementation -> benchmark -> PR
+- [ ] Stable/candidate Factory separation with human-approved promotion
+- [ ] Publish benchmark methodology and results in CI

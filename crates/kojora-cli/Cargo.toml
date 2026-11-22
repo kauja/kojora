@@ -1,0 +1,14 @@
+[package]
+name = "kojora-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "kojora"
+path = "src/main.rs"
+
+[dependencies]
+kojora-core = { path = "../kojora-core" }
