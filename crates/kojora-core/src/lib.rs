@@ -47,11 +47,7 @@ pub struct ResourceSnapshot {
 
 /// Policy interface. Decisions must still pass trusted runtime admission checks.
 pub trait Scheduler {
-    fn select_next(
-        &self,
-        tasks: &[ReadyTask],
-        snapshot: ResourceSnapshot,
-    ) -> Option<TaskId>;
+    fn select_next(&self, tasks: &[ReadyTask], snapshot: ResourceSnapshot) -> Option<TaskId>;
 }
 
 /// A simple baseline policy: highest priority that fits current available RAM.
@@ -60,11 +56,7 @@ pub trait Scheduler {
 pub struct PriorityScheduler;
 
 impl Scheduler for PriorityScheduler {
-    fn select_next(
-        &self,
-        tasks: &[ReadyTask],
-        snapshot: ResourceSnapshot,
-    ) -> Option<TaskId> {
+    fn select_next(&self, tasks: &[ReadyTask], snapshot: ResourceSnapshot) -> Option<TaskId> {
         tasks
             .iter()
             .filter(|task| task.requested_memory_bytes <= snapshot.available_memory_bytes)
