@@ -2,7 +2,7 @@
 
 **ローカルでもサーバーでも動く、軽量・拡張可能なOSSのSoftware Factory。**
 
-> **現在はpre-alpha（設計・立ち上げ段階）です。** Rust Workspaceと単一コマンド実行ランナーを含みます。
+> **現在はpre-alpha（設計・立ち上げ段階）です。** Rust Workspace、単一コマンド実行ランナー、読み取り専用のCodex CLI Adapterの試験実装を含みます。
 > AIエージェントの管理実行、Bot UI、GUI、サーバー常駐機能はまだありません。
 
 [English README](README.md) · [アーキテクチャ](docs/ARCHITECTURE.md) · [ロードマップ](docs/ROADMAP.md)
@@ -28,6 +28,22 @@ cargo run -p kojora-cli -- run -- git --version
 ```
 
 `run` はユーザーが指定した信頼済みコマンドを直接実行し、終了状態と標準出力・標準エラーを `.kojora/runs/` 以下に保存します。**サンドボックス・常駐Daemon・AIエージェント管理機能ではありません。** 子プロセスは呼び出し元の権限と環境変数を継承します。ログに秘密情報が混入する可能性があるため、信頼できるコマンドのみを実行してください。詳細は[Runnerの説明](docs/RUNNER.md)を参照してください。
+
+## 試験的なCodex CLI Adapter
+
+専用の認証プロファイルを手動で初期化した環境で、次のように実行できます。
+
+```sh
+mkdir -p "$HOME/.config/kojora/profiles"
+mkdir -m 700 "$HOME/.config/kojora/profiles/codex-primary"
+CODEX_HOME="$HOME/.config/kojora/profiles/codex-primary" codex login
+
+cargo run -p kojora-cli -- agent codex \
+  --profile "$HOME/.config/kojora/profiles/codex-primary" \
+  -- "このRustプロジェクトの構成を説明して"
+```
+
+このAdapterは非対話・読み取り専用モードのみです。親プロセスの環境変数をクリアし、認証プロファイルを同時利用しないための排他ロックを設定します。**OS全体のSandboxや安全な自律編集機能を提供するものではありません。** 実際のログイン済みCodexによる統合テストはまだ実施していません。詳しくは[Agent Adapterの説明](docs/AGENT_ADAPTER.md)を参照してください。
 
 設計への参加は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
 ライセンスは[MIT](LICENSE)です。
