@@ -134,6 +134,20 @@ pub type AgentRunner = dyn Fn(&BotRecord, &str, &Path, AgentMode, &CancellationT
     + Sync
     + 'static;
 
+/// An exclusive check slot shared with agent admission. Dropping this
+/// permit always makes the scheduler available again.
+pub struct CheckPermit {
+    scheduler: Arc<Mutex<Scheduler>>,
+}
+
+impl Drop for CheckPermit {
+    fn drop(&mut self) {
+        if let Ok(mut scheduler) = self.scheduler.lock() {
+            scheduler.finish_check();
+        }
+    }
+}
+
 pub struct Studio {
     root: PathBuf,
     state: Arc<Mutex<StudioState>>,
@@ -281,6 +295,12 @@ impl Studio {
 
     pub fn data_dir(&self) -> &Path {
         &self.root
+    }
+
+    pub fn try_acquire_check_slot(&self) -> io::Result<Option<CheckPermit>> {
+        let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
+        if !scheduler.try_begin_check() { return Ok(None); }
+        Ok(Some(CheckPermit { scheduler: Arc::clone(&self.scheduler) }))
     }
 
     pub fn is_active(&self) -> bool {

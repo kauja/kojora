@@ -58,6 +58,7 @@ struct ActiveTask {
 pub struct Scheduler {
     policy: AdmissionPolicy,
     tasks: BTreeMap<u64, ActiveTask>,
+    check_active: bool,
 }
 
 impl Scheduler {
@@ -66,7 +67,21 @@ impl Scheduler {
         Ok(Self {
             policy,
             tasks: BTreeMap::new(),
+            check_active: false,
         })
+    }
+
+    /// Exclusively reserve the host's check execution slot, with all agents idle.
+    pub fn try_begin_check(&mut self) -> bool {
+        if self.check_active || !self.tasks.is_empty() {
+            return false;
+        }
+        self.check_active = true;
+        true
+    }
+
+    pub fn finish_check(&mut self) {
+        self.check_active = false;
     }
 
     pub fn max_parallel(&self) -> usize {
@@ -90,6 +105,10 @@ impl Scheduler {
     }
 
     pub fn admit(&mut self, id: u64, profile_dir: PathBuf) -> io::Result<CancellationToken> {
+        if self.check_active {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "local check is running; agent must wait for the common execution slot"));
+        }
         if self.tasks.len() >= self.policy.max_parallel {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -162,6 +181,23 @@ mod tests {
         s.release(1);
         assert_eq!(s.reserved_mib(), 512);
         s.admit(3, "/profiles/c".into()).unwrap();
+    }
+
+    #[test]
+    fn local_check_and_agents_are_mutually_exclusive() {
+        let mut s = Scheduler::new(AdmissionPolicy::single()).unwrap();
+        assert!(s.try_begin_check());
+        assert!(!s.try_begin_check());
+        assert_eq!(
+            s.admit(1, "/profiles/a".into()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        s.finish_check();
+        s.admit(1, "/profiles/a".into()).unwrap();
+        assert!(!s.try_begin_check());
+        s.release(1);
+        assert!(s.try_begin_check());
+        s.finish_check();
     }
 
     #[test]
