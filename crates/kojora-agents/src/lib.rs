@@ -399,6 +399,28 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_fails_closed_with_an_executor_that_cannot_stop() {
+        let profile = test_profile("cancellable");
+        let workspace = env::current_dir().unwrap();
+        let executor = RecordingExecutor::default();
+        let token = CancellationToken::default();
+        let result = run_agent_cancellable(
+            &CodexExecAdapter,
+            &executor,
+            &AgentRequest {
+                prompt: "Inspect source files",
+                workspace: &workspace,
+                profile_dir: &profile,
+                log_root: &workspace.join(".kojora").join("runs"),
+            },
+            &token,
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!profile.join(".kojora-agent.lock").exists());
+        fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
     fn prevents_parallel_same_profile_use() {
         let profile = test_profile("lease");
         let first = ProfileLease::acquire(&profile).expect("first");

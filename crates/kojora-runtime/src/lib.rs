@@ -73,15 +73,18 @@ pub trait IsolatedExecutor {
         environment: &[(OsString, OsString)],
     ) -> io::Result<RunOutcome>;
 
-    /// Default fallback preserves compatibility with testing adapters.
-    /// Real executor implementations must override this to support cancellation.
+    /// Fail closed if an executor cannot stop its process tree.
+    /// Never silently run a non-cancellable agent under a cancellable API.
     fn run_isolated_cancellable(
         &self,
-        spec: &RunSpec,
-        environment: &[(OsString, OsString)],
+        _spec: &RunSpec,
+        _environment: &[(OsString, OsString)],
         _token: &CancellationToken,
     ) -> io::Result<RunOutcome> {
-        self.run_isolated(spec, environment)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executor does not implement cancellable process execution",
+        ))
     }
 }
 
