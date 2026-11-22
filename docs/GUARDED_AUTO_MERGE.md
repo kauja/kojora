@@ -42,6 +42,12 @@ Filename filtering is conservative, not a guarantee that code is harmless.
 Keep branch rulesets and all required checks enforced; in particular, add
 CodeQL and Dependency Review as required checks after their introduction.
 
+The automation verifies that the **CodeRabbit check** belongs to the
+expected `coderabbitai` GitHub App, matches the current head SHA and has
+`conclusion: success`. A `skipped` conclusion (including free-tier rate
+limits), missing review, or ambiguous duplicated checks is deliberately **not**
+accepted, even if GitHub's branch rules might otherwise allow a merge.
+
 A merge may be delayed until the next scheduled run. If CodeRabbit requires
 manual review under its small-public-repository limits, this action does NOT
 bypass that check. A PR can still remain blocked pending CodeRabbit review.

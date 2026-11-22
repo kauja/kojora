@@ -16,6 +16,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: read
 
 concurrency:
   group: guarded-auto-merge
@@ -111,6 +112,25 @@ jobs:
             # GitHub's branch ruleset is the final authority on checks/reviews.
             if [[ "$(jq -r '.mergeable_state // "unknown"' <<< "${latest}")" != "clean" ]]; then
               echo "PR #${number}: waiting for required checks or reviews"
+              continue
+            fi
+
+            # A skipped required check may be accepted by some GitHub rules.
+            # Fail closed unless CodeRabbit reviewed this exact commit.
+            checks="$(gh api "repos/${GH_REPO}/commits/${current_sha}/check-runs?per_page=100")"
+            if ! jq -e --arg sha "${current_sha}" '
+              [.check_runs[]
+               | select(
+                   .name == "CodeRabbit"
+                   and .app.slug == "coderabbitai"
+                   and .head_sha == $sha
+                 )
+              ] as $matches
+              | ($matches | length) == 1
+                and $matches[0].status == "completed"
+                and $matches[0].conclusion == "success"
+            ' <<< "${checks}" >/dev/null; then
+              echo "PR #${number}: skip (CodeRabbit missing, skipped or unsuccessful)"
               continue
             fi
 
