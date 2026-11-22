@@ -89,6 +89,8 @@ cargo run --release -p kojora-desktop
 Create a Bot with absolute workspace and profile paths. Metadata and logs
 are saved to a private local state directory. The GUI never waits on the
 rendering thread, and the headless CLI still works without compiling egui.
+Use **Stop task** for explicit cancellation: on macOS/Linux it terminates
+the agent's process group and records a durable `Cancelled` status.
 
 Read [Studio MVP](docs/STUDIO_MVP.md) for security boundaries and limitations.
 

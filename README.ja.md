@@ -4,7 +4,7 @@
 
 > **現在はpre-alpha（ローカルStudio MVP）です。** Rust製の実行ランナーとCodex CLI Adapterに加え、
 > Bot/Task/Runを永続化する制御層とネイティブGUIを試験実装しました。
-> 常駐Daemon、遠隔Worker、無人コード編集、強制終了と完全復旧は未実装です。
+> 常駐Daemon、遠隔Worker、無人PR作成、異常終了時の孤児プロセス自動回収は未実装です。
 
 [English README](README.md) · [アーキテクチャ](docs/ARCHITECTURE.md) · [ロードマップ](docs/ROADMAP.md)
 
@@ -61,6 +61,9 @@ GUIのフォームでBot名、作業ディレクトリ、認証済みCodexプロ
 遠隔Daemonではありません。同時実行は1タスクです。Codexは原則読み取り専用ですが、
 明示的に確認した場合は分離したGit Worktree内で編集案を作成し、差分をGUIで確認できます。
 このモードでも自動コミット・Pushはしません。信頼できるGitリポジトリだけで利用してください。
+実行中には **Stop task** ボタンから明示的に停止を要求でき、macOS/Linuxでは
+Codexのプロセスグループを停止し、終了状態を `Cancelled` として履歴に保存します。
+GUI自体が強制終了した際のプロセス自動回収は引き続き未実装です。
 詳細は[Studio MVP](docs/STUDIO_MVP.md)をご覧ください。
 
 設計への参加は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
