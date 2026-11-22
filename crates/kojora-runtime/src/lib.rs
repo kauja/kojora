@@ -5,12 +5,36 @@ use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+/// A thread-safe, cloneable cancellation request. No PID is exposed to the UI.
+#[derive(Debug, Default, Clone)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// A cancellation request is idempotent and safe from another thread.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Only the owner coordinating a completed execution may clear this token.
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RunSpec {
@@ -26,6 +50,8 @@ pub struct RunOutcome {
     pub run_dir: PathBuf,
     pub exit_code: Option<i32>,
     pub success: bool,
+    /// Set only when the executor received a cancellation request while the child was alive.
+    pub cancelled: bool,
     pub duration: Duration,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
@@ -46,6 +72,17 @@ pub trait IsolatedExecutor {
         spec: &RunSpec,
         environment: &[(OsString, OsString)],
     ) -> io::Result<RunOutcome>;
+
+    /// Default fallback preserves compatibility with testing adapters.
+    /// Real executor implementations must override this to support cancellation.
+    fn run_isolated_cancellable(
+        &self,
+        spec: &RunSpec,
+        environment: &[(OsString, OsString)],
+        _token: &CancellationToken,
+    ) -> io::Result<RunOutcome> {
+        self.run_isolated(spec, environment)
+    }
 }
 
 impl LocalExecutor {
@@ -53,6 +90,7 @@ impl LocalExecutor {
         &self,
         spec: &RunSpec,
         environment: Option<&[(OsString, OsString)]>,
+        cancellation: Option<&CancellationToken>,
     ) -> io::Result<RunOutcome> {
         ensure_private_log_root(&spec.log_root)?;
         let run_dir = create_run_dir(&spec.log_root)?;
@@ -72,6 +110,11 @@ impl LocalExecutor {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        if cancellation.is_some() {
+            // A new process group lets cancellation reach descendants too.
+            command.process_group(0);
+        }
         if let Some(variables) = environment {
             command.env_clear();
             command.envs(variables.iter().cloned());
@@ -106,7 +149,21 @@ impl LocalExecutor {
         let stdout_thread = thread::spawn(move || drain_to_log(stdout, stdout_file));
         let stderr_thread = thread::spawn(move || drain_to_log(stderr, stderr_file));
 
-        let status = child.wait()?;
+        let (status, cancelled) = match wait_child(&mut child, cancellation) {
+            Ok(result) => result,
+            Err(error) => {
+                // Never abandon a live child or an undrained pipe on wait errors.
+                #[cfg(unix)]
+                if cancellation.is_some() {
+                    let _ = signal_group(child.id(), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_drain(stdout_thread);
+                let _ = join_drain(stderr_thread);
+                return Err(error);
+            }
+        };
         let stdout_result = join_drain(stdout_thread);
         let stderr_result = join_drain(stderr_thread);
         let duration = started.elapsed();
@@ -115,8 +172,8 @@ impl LocalExecutor {
             .map_or_else(|| "null".to_owned(), |code| code.to_string());
         writeln!(
             events,
-            "{{\"schema_version\":1,\"event\":\"finished\",\"exit_code\":{exit_code},\"success\":{},\"duration_ms\":{}}}",
-            status.success(),
+            "{{\"schema_version\":1,\"event\":\"finished\",\"exit_code\":{exit_code},\"success\":{},\"cancelled\":{cancelled},\"duration_ms\":{}}}",
+            status.success() && !cancelled,
             duration.as_millis()
         )?;
         events.sync_all()?;
@@ -124,7 +181,8 @@ impl LocalExecutor {
         Ok(RunOutcome {
             run_dir,
             exit_code: status.code(),
-            success: status.success(),
+            success: status.success() && !cancelled,
+            cancelled,
             duration,
             stdout_bytes: stdout_result?,
             stderr_bytes: stderr_result?,
@@ -134,7 +192,7 @@ impl LocalExecutor {
 
 impl Executor for LocalExecutor {
     fn run(&self, spec: &RunSpec) -> io::Result<RunOutcome> {
-        self.execute(spec, None)
+        self.execute(spec, None, None)
     }
 }
 
@@ -144,8 +202,69 @@ impl IsolatedExecutor for LocalExecutor {
         spec: &RunSpec,
         environment: &[(OsString, OsString)],
     ) -> io::Result<RunOutcome> {
-        self.execute(spec, Some(environment))
+        self.execute(spec, Some(environment), None)
     }
+
+    fn run_isolated_cancellable(
+        &self,
+        spec: &RunSpec,
+        environment: &[(OsString, OsString)],
+        token: &CancellationToken,
+    ) -> io::Result<RunOutcome> {
+        self.execute(spec, Some(environment), Some(token))
+    }
+}
+
+/// Wait without blocking cancellation. On Unix, the child is started in its
+/// own process group. TERM offers a brief cleanup window; KILL then ensures
+/// children that ignore TERM cannot keep stdout/stderr pipes open.
+fn wait_child(
+    child: &mut Child,
+    cancellation: Option<&CancellationToken>,
+) -> io::Result<(ExitStatus, bool)> {
+    let Some(token) = cancellation else {
+        return child.wait().map(|status| (status, false));
+    };
+    loop {
+        if token.is_cancelled() {
+            #[cfg(unix)]
+            {
+                // Do not reap the leader between TERM and KILL: its PID cannot
+                // be reused while the zombie remains un-waited, avoiding
+                // accidentally signalling a different process group.
+                signal_group(child.id(), libc::SIGTERM)?;
+                thread::sleep(Duration::from_millis(200));
+                signal_group(child.id(), libc::SIGKILL)?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows currently stops the direct child only. The native
+                // Studio build is supported on Unix desktop platforms.
+                let _ = child.kill();
+            }
+            return child.wait().map(|status| (status, true));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+#[cfg(unix)]
+fn signal_group(child_pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let pid = i32::try_from(child_pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child PID"))?;
+    // SAFETY: negative PID targets the dedicated process group created by
+    // CommandExt::process_group(0); no shell or arbitrary PID is accepted.
+    let result = unsafe { libc::kill(-pid, signal) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Fixed-size buffers keep log capture independent of total output volume.
@@ -335,6 +454,40 @@ mod tests {
             fs::read(outcome.run_dir.join("stdout.log")).unwrap(),
             b"missing:present"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_terminates_process_group_and_journals_outcome() {
+        let root = test_root("cancellation");
+        let token = CancellationToken::default();
+        let request = request(&root, "trap '' TERM; sleep 15 & wait");
+        let copy = token.clone();
+        let start = Instant::now();
+        let worker = thread::spawn(move || {
+            LocalExecutor.run_isolated_cancellable(&request, &[], &copy)
+        });
+        thread::sleep(Duration::from_millis(250));
+        token.cancel();
+        let outcome = worker.join().unwrap().expect("cancellation result");
+        assert!(outcome.cancelled);
+        assert!(!outcome.success);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let events = fs::read_to_string(outcome.run_dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("\"cancelled\":true"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finished_process_is_not_marked_cancelled() {
+        let root = test_root("not-cancelled");
+        let token = CancellationToken::default();
+        let outcome = LocalExecutor
+            .run_isolated_cancellable(&request(&root, "printf ok"), &[], &token)
+            .unwrap();
+        assert!(outcome.success);
+        assert!(!outcome.cancelled);
+        assert_eq!(fs::read(outcome.run_dir.join("stdout.log")).unwrap(), b"ok");
         fs::remove_dir_all(root).unwrap();
     }
 
