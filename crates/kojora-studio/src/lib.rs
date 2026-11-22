@@ -2,12 +2,13 @@
 //! No UI framework is used here. Execution is single-flight on purpose.
 
 use fs2::FileExt;
-use kojora_agents::{run_agent, AgentRequest, CodexExecAdapter};
+use kojora_agents::{run_agent, AgentRequest, CodexExecAdapter, CodexWorkspaceWriteAdapter};
 use kojora_runtime::{LocalExecutor, RunOutcome};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -80,12 +81,23 @@ impl TaskStatus {
     }
 }
 
+/// Explicit capability boundary for a single task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentMode {
+    #[default]
+    Inspect,
+    /// User requested changes in a detached Git worktree, never in the main checkout.
+    EditWorktree,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: u64,
     pub bot_id: u64,
     pub run_id: u64,
     pub prompt: String,
+    #[serde(default)]
+    pub mode: AgentMode,
     pub status: TaskStatus,
     pub created_ms: u64,
 }
@@ -100,12 +112,14 @@ pub struct RunRecord {
     pub finished_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub run_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub worktree_dir: Option<PathBuf>,
     pub error: Option<String>,
 }
 
 /// A runner can be replaced by a credential-free fake in automated tests.
 pub type AgentRunner =
-    dyn Fn(&BotRecord, &str, &Path) -> io::Result<RunOutcome> + Send + Sync + 'static;
+    dyn Fn(&BotRecord, &str, &Path, AgentMode) -> io::Result<RunOutcome> + Send + Sync + 'static;
 
 pub struct Studio {
     root: PathBuf,
@@ -120,17 +134,19 @@ impl Studio {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         Self::open_with_runner(
             root,
-            Arc::new(|bot, prompt, log_root| {
-                run_agent(
-                    &CodexExecAdapter,
-                    &LocalExecutor,
-                    &AgentRequest {
-                        prompt,
-                        workspace: &bot.workspace,
-                        profile_dir: &bot.profile_dir,
-                        log_root,
-                    },
-                )
+            Arc::new(|bot, prompt, log_root, mode| {
+                let request = AgentRequest {
+                    prompt,
+                    workspace: &bot.workspace,
+                    profile_dir: &bot.profile_dir,
+                    log_root,
+                };
+                match mode {
+                    AgentMode::Inspect => run_agent(&CodexExecAdapter, &LocalExecutor, &request),
+                    AgentMode::EditWorktree => {
+                        run_agent(&CodexWorkspaceWriteAdapter, &LocalExecutor, &request)
+                    }
+                }
             }),
         )
     }
@@ -227,6 +243,11 @@ impl Studio {
 
     /// Submit one Codex task on a background thread. At most one task runs.
     pub fn submit(&self, bot_id: u64, prompt: &str) -> io::Result<u64> {
+        self.submit_with_mode(bot_id, prompt, AgentMode::Inspect)
+    }
+
+    /// Opt-in edit runs get a detached Git worktree under Studio's private state root.
+    pub fn submit_with_mode(&self, bot_id: u64, prompt: &str, mode: AgentMode) -> io::Result<u64> {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -261,6 +282,7 @@ impl Studio {
                 bot_id,
                 run_id,
                 prompt: prompt.to_owned(),
+                mode,
                 status: TaskStatus::Running,
                 created_ms: now,
             });
@@ -273,6 +295,7 @@ impl Studio {
                 finished_ms: None,
                 exit_code: None,
                 run_dir: None,
+                worktree_dir: None,
                 error: None,
             });
             persist(&self.root, &state)?;
@@ -304,7 +327,21 @@ impl Studio {
                 }
                 let _guard = ActiveGuard(active);
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
-                let outcome = runner(&bot, &prompt, &task_log_root);
+                let mut worktree = None;
+                let outcome = match mode {
+                    AgentMode::Inspect => runner(&bot, &prompt, &task_log_root, mode),
+                    AgentMode::EditWorktree => {
+                        match create_detached_worktree(&root, &bot.workspace, task_id) {
+                            Ok(path) => {
+                                worktree = Some(path.clone());
+                                let mut isolated_bot = bot.clone();
+                                isolated_bot.workspace = path;
+                                runner(&isolated_bot, &prompt, &task_log_root, mode)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
                 let mut state = match shared_state.lock() {
                     Ok(state) => state,
                     Err(_) => return,
@@ -330,6 +367,7 @@ impl Studio {
                     run.status = status;
                     run.exit_code = exit_code;
                     run.run_dir = run_dir;
+                    run.worktree_dir = worktree;
                     run.error = error;
                     run.finished_ms = unix_ms().ok();
                 }
@@ -355,6 +393,38 @@ impl Studio {
         }
 
         Ok(task_id)
+    }
+
+    /// Inspect tracked changes and untracked filenames in a completed edit worktree.
+    /// Output is bounded in memory; no diff/commit/push side effects.
+    pub fn read_worktree_diff(&self, task_id: u64) -> io::Result<String> {
+        let state = self.snapshot()?;
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+        let run = state
+            .runs
+            .iter()
+            .find(|run| run.id == task.run_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "run not found"))?;
+        let worktree = run.worktree_dir.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no edit worktree for this task")
+        })?;
+        if !worktree.starts_with(self.root.join("worktrees")) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid worktree path"));
+        }
+        let mut result = run_git_limited(worktree, &["status", "--short", "--untracked-files=normal"])?;
+        result.push_str("\n--- Tracked file changes ---\n");
+        let remaining = MAX_LOG_TAIL_BYTES.saturating_sub(result.len()).max(1);
+        result.push_str(&run_git_limited_with_limit(
+            worktree,
+            &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
+            remaining,
+        )?);
+        result.truncate(MAX_LOG_TAIL_BYTES.min(result.len()));
+        Ok(result)
     }
 
     /// Read only the last 32 KiB of the stdout/stderr log, never the whole log.
@@ -432,6 +502,89 @@ pub fn extract_agent_text(log: &str) -> String {
         }
     }
     messages.join("\n\n")
+}
+
+/// Run Git only for local trusted repositories. Never evaluate shell input.
+fn git_command(workspace: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-C")
+        .arg(workspace)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::Result<PathBuf> {
+    let workspace = fs::canonicalize(workspace)?;
+    let output = git_command(&workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "workspace is not a Git checkout"));
+    }
+    let git_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if fs::canonicalize(&git_root)? != workspace {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Bot workspace must be the root of its Git checkout",
+        ));
+    }
+    if root.starts_with(&workspace) || workspace.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Studio state and Git checkout must be separate",
+        ));
+    }
+    let directory = root.join("worktrees");
+    ensure_private_directory(&directory)?;
+    let destination = directory.join(format!("task-{task_id}"));
+    if destination.exists() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "task worktree already exists"));
+    }
+    let status = git_command(&workspace)
+        .args(["worktree", "add", "--detach"])
+        .arg(&destination)
+        .arg("HEAD")
+        .stdout(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("Git could not create a detached task worktree"));
+    }
+    Ok(destination)
+}
+
+fn run_git_limited(worktree: &Path, args: &[&str]) -> io::Result<String> {
+    run_git_limited_with_limit(worktree, args, MAX_LOG_TAIL_BYTES / 2)
+}
+
+fn run_git_limited_with_limit(
+    worktree: &Path,
+    args: &[&str],
+    limit: usize,
+) -> io::Result<String> {
+    let mut child = git_command(worktree).args(args).stdout(Stdio::piped()).spawn()?;
+    let output = (|| -> io::Result<Vec<u8>> {
+        let stdout = child.stdout.as_mut().ok_or_else(|| io::Error::other("no git stdout"))?;
+        let mut data = Vec::new();
+        stdout.take((limit + 1) as u64).read_to_end(&mut data)?;
+        Ok(data)
+    })();
+    let _ = child.kill();
+    let status = child.wait()?;
+    let mut data = output?;
+    let truncated = data.len() > limit;
+    data.truncate(limit);
+    let mut result = String::from_utf8_lossy(&data).into_owned();
+    if truncated {
+        result.push_str("\n[diff output truncated]\n");
+    } else if !status.success() && status.code().is_some() {
+        // kill may race with a naturally completed command.
+        return Err(io::Error::other("Git diff/status command failed"));
+    }
+    Ok(result)
 }
 
 fn tail_file(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -562,7 +715,7 @@ mod tests {
     }
 
     fn fake_runner() -> Arc<AgentRunner> {
-        Arc::new(|_bot, prompt, log_root| {
+        Arc::new(|_bot, prompt, log_root, _mode| {
             let path = log_root.join("fake-run");
             fs::create_dir_all(&path)?;
             fs::write(path.join("stdout.log"), format!("received: {prompt}"))?;
@@ -634,6 +787,7 @@ mod tests {
             bot_id: 2,
             run_id: 3,
             prompt: "test".into(),
+            mode: AgentMode::Inspect,
             status: TaskStatus::Running,
             created_ms: 1,
         });
@@ -646,6 +800,7 @@ mod tests {
             finished_ms: None,
             exit_code: None,
             run_dir: None,
+            worktree_dir: None,
             error: None,
         });
         persist(&root, &state).unwrap();
@@ -666,6 +821,70 @@ mod tests {
     fn parses_codex_messages_without_loading_complete_logs() {
         let log = "{\"type\":\"thread.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Hello\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"text\":\"ignore\"}}\n";
         assert_eq!(extract_agent_text(log), "Hello");
+    }
+
+    #[test]
+    fn edit_mode_never_mutates_original_checkout() {
+        let root = temporary_root("worktree");
+        let project = root.join("checkout");
+        fs::create_dir(&project).unwrap();
+        let status = Command::new("git").arg("init").arg(&project).status().unwrap();
+        assert!(status.success());
+        fs::write(project.join("file.txt"), "initial\n").unwrap();
+        let status = git_command(&project)
+            .args(["add", "file.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = git_command(&project)
+            .args(["-c", "user.name=Kojora", "-c", "user.email=kojora@example.invalid"])
+            .args(["commit", "-m", "Initial"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let studio_root = root.join("state");
+        let fake: Arc<AgentRunner> = Arc::new(|bot, _prompt, log_root, mode| {
+            assert_eq!(mode, AgentMode::EditWorktree);
+            fs::write(bot.workspace.join("file.txt"), "changed\n")?;
+            let logs = log_root.join("fake-run");
+            fs::create_dir_all(&logs)?;
+            fs::write(logs.join("stdout.log"), b"ok")?;
+            Ok(RunOutcome {
+                run_dir: logs,
+                exit_code: Some(0),
+                success: true,
+                duration: Duration::ZERO,
+                stdout_bytes: 2,
+                stderr_bytes: 0,
+            })
+        });
+        let studio = Studio::open_with_runner(&studio_root, fake).unwrap();
+        let id = studio
+            .add_bot("Editor", project.clone(), root.join("profile"))
+            .unwrap();
+        let task = studio
+            .submit_with_mode(id, "Modify file", AgentMode::EditWorktree)
+            .unwrap();
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+        assert_eq!(fs::read_to_string(project.join("file.txt")).unwrap(), "initial\n");
+        let snapshot = studio.snapshot().unwrap();
+        assert_eq!(snapshot.tasks[0].mode, AgentMode::EditWorktree);
+        assert_eq!(snapshot.tasks[0].status, TaskStatus::Succeeded);
+        let worktree = snapshot.runs[0].worktree_dir.as_ref().unwrap();
+        assert_eq!(fs::read_to_string(worktree.join("file.txt")).unwrap(), "changed\n");
+        assert!(studio.read_worktree_diff(task).unwrap().contains("+changed"));
+        drop(studio);
+        let _ = git_command(&project).args(["worktree", "remove", "--force"])
+            .arg(worktree).status();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
