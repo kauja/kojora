@@ -3,7 +3,8 @@
 
 use fs2::FileExt;
 use kojora_agents::{
-    run_agent_cancellable, AgentRequest, CodexExecAdapter, CodexWorkspaceWriteAdapter,
+    run_agent_cancellable, run_agent_cancellable_limited, AgentRequest, CodexExecAdapter,
+    CodexWorkspaceWriteAdapter,
 };
 use kojora_runtime::{CancellationToken, LocalExecutor, RunOutcome};
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,43 @@ impl Studio {
                         &LocalExecutor,
                         &request,
                         cancellation,
+                    ),
+                }
+            }),
+        )
+    }
+
+    /// Opens the single-instance state store with per-child OS ceilings.
+    /// Worker Daemon calls this; Desktop can continue to use unrestricted
+    /// local mode. No GUI dependencies are imported by the service.
+    pub fn open_with_limits(
+        root: impl Into<PathBuf>,
+        limits: kojora_runtime::ProcessLimits,
+    ) -> io::Result<Self> {
+        limits.validate()?;
+        Self::open_with_runner(
+            root,
+            Arc::new(move |bot, prompt, log_root, mode, cancellation| {
+                let request = AgentRequest {
+                    prompt,
+                    workspace: &bot.workspace,
+                    profile_dir: &bot.profile_dir,
+                    log_root,
+                };
+                match mode {
+                    AgentMode::Inspect => run_agent_cancellable_limited(
+                        &CodexExecAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                        limits,
+                    ),
+                    AgentMode::EditWorktree => run_agent_cancellable_limited(
+                        &CodexWorkspaceWriteAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                        limits,
                     ),
                 }
             }),
