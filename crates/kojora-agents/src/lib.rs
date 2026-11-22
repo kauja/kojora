@@ -3,7 +3,7 @@
 //! This bootstrap adapter is NOT a persistent session manager or a sandbox.
 //! Its public Rust traits are still experimental (not the future plugin ABI).
 
-use kojora_runtime::{IsolatedExecutor, RunOutcome, RunSpec};
+use kojora_runtime::{CancellationToken, IsolatedExecutor, RunOutcome, RunSpec};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -128,11 +128,35 @@ pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
     executor: &E,
     request: &AgentRequest<'_>,
 ) -> io::Result<RunOutcome> {
+    run_agent_inner(adapter, executor, request, None)
+}
+
+/// A cancellation-aware agent run. The profile lease remains held until
+/// the subprocess has exited and all output has been drained.
+pub fn run_agent_cancellable<A: AgentAdapter, E: IsolatedExecutor>(
+    adapter: &A,
+    executor: &E,
+    request: &AgentRequest<'_>,
+    token: &CancellationToken,
+) -> io::Result<RunOutcome> {
+    run_agent_inner(adapter, executor, request, Some(token))
+}
+
+fn run_agent_inner<A: AgentAdapter, E: IsolatedExecutor>(
+    adapter: &A,
+    executor: &E,
+    request: &AgentRequest<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> io::Result<RunOutcome> {
     if request.prompt.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "agent prompt must not be blank",
         ));
+    }
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "task cancelled before launch"));
     }
 
     let workspace = fs::canonicalize(request.workspace)?;
@@ -180,7 +204,14 @@ pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
         log_root: request.log_root.to_owned(),
     };
 
-    executor.run_isolated(&spec, &child_environment)
+    if let Some(token) = cancellation {
+        if token.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "task cancelled before launch"));
+        }
+        executor.run_isolated_cancellable(&spec, &child_environment, token)
+    } else {
+        executor.run_isolated(&spec, &child_environment)
+    }
 }
 
 fn verify_private_profile(path: &Path) -> io::Result<PathBuf> {
@@ -267,6 +298,7 @@ mod tests {
                 run_dir: spec.log_root.join("fake"),
                 exit_code: Some(7),
                 success: false,
+                cancelled: false,
                 duration: Duration::ZERO,
                 stdout_bytes: 0,
                 stderr_bytes: 0,
