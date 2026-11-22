@@ -413,9 +413,13 @@ impl Studio {
             io::Error::new(io::ErrorKind::NotFound, "no edit worktree for this task")
         })?;
         if !worktree.starts_with(self.root.join("worktrees")) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid worktree path"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid worktree path",
+            ));
         }
-        let mut result = run_git_limited(worktree, &["status", "--short", "--untracked-files=normal"])?;
+        let mut result =
+            run_git_limited(worktree, &["status", "--short", "--untracked-files=normal"])?;
         result.push_str("\n--- Tracked file changes ---\n");
         let remaining = MAX_LOG_TAIL_BYTES.saturating_sub(result.len()).max(1);
         result.push_str(&run_git_limited_with_limit(
@@ -529,7 +533,10 @@ fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
     if !output.status.success() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "workspace is not a Git checkout"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace is not a Git checkout",
+        ));
     }
     let git_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     if fs::canonicalize(&git_root)? != workspace {
@@ -548,7 +555,10 @@ fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::
     ensure_private_directory(&directory)?;
     let destination = directory.join(format!("task-{task_id}"));
     if destination.exists() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "task worktree already exists"));
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "task worktree already exists",
+        ));
     }
     let status = git_command(&workspace)
         .args(["worktree", "add", "--detach"])
@@ -557,7 +567,9 @@ fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::
         .stdout(Stdio::null())
         .status()?;
     if !status.success() {
-        return Err(io::Error::other("Git could not create a detached task worktree"));
+        return Err(io::Error::other(
+            "Git could not create a detached task worktree",
+        ));
     }
     Ok(destination)
 }
@@ -566,14 +578,16 @@ fn run_git_limited(worktree: &Path, args: &[&str]) -> io::Result<String> {
     run_git_limited_with_limit(worktree, args, MAX_LOG_TAIL_BYTES / 2)
 }
 
-fn run_git_limited_with_limit(
-    worktree: &Path,
-    args: &[&str],
-    limit: usize,
-) -> io::Result<String> {
-    let mut child = git_command(worktree).args(args).stdout(Stdio::piped()).spawn()?;
+fn run_git_limited_with_limit(worktree: &Path, args: &[&str], limit: usize) -> io::Result<String> {
+    let mut child = git_command(worktree)
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()?;
     let output = (|| -> io::Result<Vec<u8>> {
-        let stdout = child.stdout.as_mut().ok_or_else(|| io::Error::other("no git stdout"))?;
+        let stdout = child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no git stdout"))?;
         let mut data = Vec::new();
         stdout.take((limit + 1) as u64).read_to_end(&mut data)?;
         Ok(data)
@@ -843,7 +857,11 @@ mod tests {
         let root = temporary_root("worktree");
         let project = root.join("checkout");
         fs::create_dir(&project).unwrap();
-        let status = Command::new("git").arg("init").arg(&project).status().unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&project)
+            .status()
+            .unwrap();
         assert!(status.success());
         fs::write(project.join("file.txt"), "initial\n").unwrap();
         let status = git_command(&project)
@@ -852,7 +870,12 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let status = git_command(&project)
-            .args(["-c", "user.name=Kojora", "-c", "user.email=kojora@example.invalid"])
+            .args([
+                "-c",
+                "user.name=Kojora",
+                "-c",
+                "user.email=kojora@example.invalid",
+            ])
             .args(["commit", "-m", "Initial"])
             .stdout(Stdio::null())
             .status()
@@ -889,16 +912,27 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!studio.is_active());
-        assert_eq!(fs::read_to_string(project.join("file.txt")).unwrap(), "initial\n");
+        assert_eq!(
+            fs::read_to_string(project.join("file.txt")).unwrap(),
+            "initial\n"
+        );
         let snapshot = studio.snapshot().unwrap();
         assert_eq!(snapshot.tasks[0].mode, AgentMode::EditWorktree);
         assert_eq!(snapshot.tasks[0].status, TaskStatus::Succeeded);
         let worktree = snapshot.runs[0].worktree_dir.as_ref().unwrap();
-        assert_eq!(fs::read_to_string(worktree.join("file.txt")).unwrap(), "changed\n");
-        assert!(studio.read_worktree_diff(task).unwrap().contains("+changed"));
+        assert_eq!(
+            fs::read_to_string(worktree.join("file.txt")).unwrap(),
+            "changed\n"
+        );
+        assert!(studio
+            .read_worktree_diff(task)
+            .unwrap()
+            .contains("+changed"));
         drop(studio);
-        let _ = git_command(&project).args(["worktree", "remove", "--force"])
-            .arg(worktree).status();
+        let _ = git_command(&project)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree)
+            .status();
         fs::remove_dir_all(root).unwrap();
     }
 

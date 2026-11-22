@@ -436,7 +436,10 @@ impl DesktopApp {
                 .small(),
             );
         });
-        ui.checkbox(&mut self.edit_mode, "Allow edits in a separate Git worktree");
+        ui.checkbox(
+            &mut self.edit_mode,
+            "Allow edits in a separate Git worktree",
+        );
         if self.edit_mode {
             ui.colored_label(
                 COLOR_ERROR,
