@@ -1,8 +1,11 @@
 //! Headless local studio control plane: durable bot/task/run records.
 //! No UI framework is used here. Execution is single-flight on purpose.
 
+pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
+
+use scheduler::{AdmissionPolicy, Scheduler};
 
 use fs2::FileExt;
 use kojora_agents::{
@@ -15,7 +18,6 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,9 +136,7 @@ pub type AgentRunner = dyn Fn(&BotRecord, &str, &Path, AgentMode, &CancellationT
 pub struct Studio {
     root: PathBuf,
     state: Arc<Mutex<StudioState>>,
-    active: Arc<AtomicBool>,
-    active_task: Arc<AtomicU64>,
-    cancellation: CancellationToken,
+    scheduler: Arc<Mutex<Scheduler>>,
     last_error: Arc<Mutex<Option<String>>>,
     runner: Arc<AgentRunner>,
     _instance_lock: Arc<File>,
@@ -212,6 +212,15 @@ impl Studio {
         root: impl Into<PathBuf>,
         runner: Arc<AgentRunner>,
     ) -> io::Result<Self> {
+        Self::open_with_runner_and_policy(root, runner, AdmissionPolicy::single())
+    }
+
+    pub fn open_with_runner_and_policy(
+        root: impl Into<PathBuf>,
+        runner: Arc<AgentRunner>,
+        policy: AdmissionPolicy,
+    ) -> io::Result<Self> {
+        let scheduler = Scheduler::new(policy)?;
         let root = root.into();
         if !root.is_absolute() {
             return Err(io::Error::new(
@@ -249,9 +258,7 @@ impl Studio {
         Ok(Self {
             root,
             state: Arc::new(Mutex::new(state)),
-            active: Arc::new(AtomicBool::new(false)),
-            active_task: Arc::new(AtomicU64::new(0)),
-            cancellation: CancellationToken::default(),
+            scheduler: Arc::new(Mutex::new(scheduler)),
             last_error: Arc::new(Mutex::new(None)),
             runner,
             _instance_lock: lock,
@@ -267,29 +274,48 @@ impl Studio {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.active_task_count() != 0
     }
 
-    /// Returns the one currently executing Task ID, if any.
+    pub fn active_task_count(&self) -> usize {
+        self.scheduler.lock().map_or(0, |s| s.active_count())
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        self.scheduler.lock().map_or(1, |s| s.max_parallel())
+    }
+
+    pub fn reserved_memory_mib(&self) -> u64 {
+        self.scheduler.lock().map_or(0, |s| s.reserved_mib())
+    }
+
+    pub fn active_task_ids(&self) -> Vec<u64> {
+        self.scheduler
+            .lock()
+            .map_or_else(|_| Vec::new(), |s| s.active_ids())
+    }
+
+    /// Compatibility with the single-task GUI; parallel clients use all IDs.
     pub fn active_task_id(&self) -> Option<u64> {
-        let id = self.active_task.load(Ordering::Acquire);
-        (id != 0 && self.is_active()).then_some(id)
+        self.active_task_ids().into_iter().next()
     }
 
     pub fn cancellation_requested(&self, task_id: u64) -> bool {
-        self.active_task_id() == Some(task_id) && self.cancellation.is_cancelled()
+        self.scheduler
+            .lock()
+            .ok()
+            .and_then(|s| s.token(task_id))
+            .is_some_and(|token| token.is_cancelled())
     }
 
-    /// Request cancellation of exactly the active task. This does not block
-    /// the GUI while the process group is being terminated and logs drained.
     pub fn cancel_task(&self, task_id: u64) -> io::Result<()> {
-        if self.active_task_id() != Some(task_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "task is not the currently active run",
-            ));
-        }
-        self.cancellation.cancel();
+        let token = self
+            .scheduler
+            .lock()
+            .map_err(lock_error)?
+            .token(task_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task is not active"))?;
+        token.cancel();
         Ok(())
     }
 
@@ -337,21 +363,7 @@ impl Studio {
                 "prompt must contain 1-32768 bytes",
             ));
         }
-        if self
-            .active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "another agent run is active; this MVP runs one at a time",
-            ));
-        }
-
-        // Only the sole active submitter may reset the shared token.
-        self.cancellation.reset();
-
-        let prepared = (|| -> io::Result<(u64, u64, BotRecord)> {
+        let prepared = (|| -> io::Result<(u64, u64, BotRecord, CancellationToken)> {
             let mut state = self.state.lock().map_err(lock_error)?;
             let mut candidate = state.clone();
             let bot = candidate
@@ -385,25 +397,20 @@ impl Studio {
                 worktree_dir: None,
                 error: None,
             });
-            commit_state(&self.root, &mut state, candidate)?;
-            Ok((task_id, run_id, bot))
-        })();
-
-        let (task_id, run_id, bot) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.active.store(false, Ordering::Release);
+            let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
+            let token = scheduler.admit(task_id, bot.profile_dir.clone())?;
+            if let Err(error) = commit_state(&self.root, &mut state, candidate) {
+                scheduler.release(task_id);
                 return Err(error);
             }
-        };
+            Ok((task_id, run_id, bot, token))
+        })();
 
-        self.active_task.store(task_id, Ordering::Release);
+        let (task_id, run_id, bot, cancellation) = prepared?;
         let root = self.root.clone();
         let instance_lock = Arc::clone(&self._instance_lock);
         let shared_state = Arc::clone(&self.state);
-        let active = Arc::clone(&self.active);
-        let active_task = Arc::clone(&self.active_task);
-        let cancellation = self.cancellation.clone();
+        let scheduler = Arc::clone(&self.scheduler);
         let last_error = Arc::clone(&self.last_error);
         let runner = Arc::clone(&self.runner);
         let prompt = prompt.to_owned();
@@ -412,22 +419,17 @@ impl Studio {
             .spawn(move || {
                 let _instance_lock = instance_lock;
                 struct ActiveGuard {
-                    active: Arc<AtomicBool>,
-                    active_task: Arc<AtomicU64>,
-                    cancellation: CancellationToken,
+                    scheduler: Arc<Mutex<Scheduler>>,
+                    task_id: u64,
                 }
                 impl Drop for ActiveGuard {
                     fn drop(&mut self) {
-                        self.active_task.store(0, Ordering::Release);
-                        self.cancellation.reset();
-                        self.active.store(false, Ordering::Release);
+                        if let Ok(mut scheduler) = self.scheduler.lock() {
+                            scheduler.release(self.task_id);
+                        }
                     }
                 }
-                let _guard = ActiveGuard {
-                    active,
-                    active_task,
-                    cancellation: cancellation.clone(),
-                };
+                let _guard = ActiveGuard { scheduler, task_id };
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
                 let outcome = if cancellation.is_cancelled() {
                     Err(io::Error::new(
@@ -518,9 +520,7 @@ impl Studio {
                 }
             });
         if let Err(error) = spawn {
-            self.active_task.store(0, Ordering::Release);
-            self.cancellation.reset();
-            self.active.store(false, Ordering::Release);
+            self.scheduler.lock().map_err(lock_error)?.release(task_id);
             let mut state = self.state.lock().map_err(lock_error)?;
             let mut candidate = state.clone();
             if let Some(task) = candidate.tasks.iter_mut().find(|task| task.id == task_id) {
