@@ -261,7 +261,11 @@ impl DesktopApp {
             {
                 self.history_page -= 1;
             }
-            ui.label(format!("History page {} / {}", self.history_page + 1, max_page + 1));
+            ui.label(format!(
+                "History page {} / {}",
+                self.history_page + 1,
+                max_page + 1
+            ));
             if ui
                 .add_enabled(self.history_page < max_page, egui::Button::new("Older"))
                 .clicked()
