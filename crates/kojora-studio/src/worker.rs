@@ -45,6 +45,7 @@ enum Request {
     Status,
     Snapshot,
     Checks,
+    CheckLog { check_id: u64, stderr: bool },
     QueueCheck {
         task_id: u64,
         hook: HookPhase,
@@ -167,6 +168,9 @@ fn dispatch(
         Request::Status => (Response::Status(status(studio, limits, checks)), false),
         Request::Snapshot => (Response::Snapshot(studio.snapshot()?), false),
         Request::Checks => (Response::Checks(checks.snapshot()?), false),
+        Request::CheckLog { check_id, stderr } => (
+            Response::Text(checks.read_log_tail(check_id, stderr)?), false
+        ),
         Request::QueueCheck { task_id, hook, kind } => {
             let state = studio.snapshot()?;
             let task = state.tasks.iter().find(|t| t.id == task_id)
@@ -403,6 +407,13 @@ impl WorkerClient {
         }
     }
 
+    pub fn check_log(&self, check_id: u64, stderr: bool) -> io::Result<String> {
+        match self.request(Request::CheckLog { check_id, stderr })? {
+            Response::Text(value) => Ok(value),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected check log")),
+        }
+    }
+
     pub fn checks(&self) -> io::Result<Vec<CheckRecord>> {
         match self.request(Request::Checks)? {
             Response::Checks(value) => Ok(value),
@@ -516,6 +527,14 @@ impl StudioConnection {
         match self {
             Self::Local(value) => value.data_dir(),
             Self::Worker(value) => value.data_dir(),
+        }
+    }
+
+    pub fn check_log(&self, check_id: u64, stderr: bool) -> io::Result<String> {
+        match self {
+            Self::Local(_) => Err(io::Error::new(io::ErrorKind::Unsupported,
+                "check logs require a separate Worker")),
+            Self::Worker(value) => value.check_log(check_id, stderr),
         }
     }
 

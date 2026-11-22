@@ -216,6 +216,21 @@ impl CheckQueue {
         Ok(Self { root, policy, journal, sender })
     }
 
+    /// Return a bounded tail of a check log, never the entire compiler output.
+    pub fn read_log_tail(&self, check_id: u64, stderr: bool) -> io::Result<String> {
+        let records = self.snapshot()?;
+        let record = records.iter().find(|r| r.id == check_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "check not found"))?;
+        let Some(run_dir) = &record.run_dir else { return Ok(String::new()) };
+        let prefix = self.root.join("runs").join(format!("check-{check_id}"));
+        if !run_dir.starts_with(&prefix) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "check log location is outside its private run directory"));
+        }
+        let name = if stderr { "stderr.log" } else { "stdout.log" };
+        crate::tail_file(&run_dir.join(name), 32 * 1024)
+    }
+
     pub fn snapshot(&self) -> io::Result<Vec<CheckRecord>> {
         Ok(self.journal.lock().map_err(lock_error)?.records.clone())
     }
