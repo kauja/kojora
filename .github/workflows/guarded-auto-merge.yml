@@ -114,6 +114,25 @@ jobs:
               continue
             fi
 
+            # A skipped required check may be accepted by some GitHub rules.
+            # Fail closed unless CodeRabbit reviewed this exact commit.
+            checks="$(gh api "repos/${GH_REPO}/commits/${current_sha}/check-runs?per_page=100")"
+            if ! jq -e --arg sha "${current_sha}" '
+              [.check_runs[]
+               | select(
+                   .name == "CodeRabbit"
+                   and .app.slug == "coderabbitai"
+                   and .head_sha == $sha
+                 )
+              ] as $matches
+              | ($matches | length) == 1
+                and $matches[0].status == "completed"
+                and $matches[0].conclusion == "success"
+            ' <<< "${checks}" >/dev/null; then
+              echo "PR #${number}: skip (CodeRabbit missing, skipped or unsuccessful)"
+              continue
+            fi
+
             echo "PR #${number}: attempting guarded squash merge"
             if ! gh pr merge "${number}" --repo "${GH_REPO}" \
               --squash --match-head-commit "${current_sha}"; then
