@@ -7,9 +7,9 @@
 use crate::{AgentMode, Studio, StudioState};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -174,12 +174,10 @@ impl Drop for SocketGuard {
 /// The daemon is the only process that may hold the state-file lock.
 pub fn serve(studio: Studio, limits: ProcessLimits) -> io::Result<()> {
     limits.validate()?;
-    let root = studio.data_dir().canonicalize()?;
-    if root != studio.data_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "worker data directory must be a canonical absolute path"));
-    }
-    let socket = root.join("worker.sock");
+    // Studio::open already checked that the root is an absolute, private,
+    // real directory. Do not require a canonical spelling: on macOS /var
+    // commonly resolves to /private/var.
+    let socket = studio.data_dir().join("worker.sock");
     if fs::symlink_metadata(&socket).is_ok() {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists,
             "worker.sock already exists; verify no worker is running before removing a stale socket"));
