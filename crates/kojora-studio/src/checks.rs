@@ -737,6 +737,64 @@ mod tests {
     }
 
     #[test]
+    fn check_waits_for_active_agent_before_claiming_shared_slot() {
+        use crate::{AgentRunner, Studio};
+        use crate::scheduler::AdmissionPolicy;
+        let (root, policy, worktree) = setup();
+        let release_agent = Arc::new(AtomicBool::new(false));
+        let agent_flag = Arc::clone(&release_agent);
+        let agent: Arc<AgentRunner> = Arc::new(move |_, _, log_root, _, _| {
+            while !agent_flag.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let dir = log_root.join("fake");
+            fs::create_dir_all(&dir)?;
+            Ok(RunOutcome {
+                run_dir: dir, exit_code: Some(0), success: true,
+                cancelled: false, duration: Duration::ZERO,
+                stdout_bytes: 0, stderr_bytes: 0,
+            })
+        });
+        let studio = Arc::new(
+            Studio::open_with_runner_and_policy(&root, agent, AdmissionPolicy::single()).unwrap()
+        );
+        let bot = studio.add_bot("Tester", root.join("workspace"), root.join("profile")).unwrap();
+        let _id = studio.submit(bot, "Long running").unwrap();
+        let for_checks = Arc::clone(&studio);
+        let check_runner: Arc<CheckRunner> = Arc::new(|_, log_root, _, _, _| {
+            let dir = log_root.join("test");
+            fs::create_dir_all(&dir)?;
+            Ok(RunOutcome {
+                run_dir: dir, exit_code: Some(0), success: true,
+                cancelled: false, duration: Duration::ZERO,
+                stdout_bytes: 0, stderr_bytes: 0,
+            })
+        });
+        let checks = CheckQueue::open_with_runner_and_admission(
+            root.join("checks"),
+            policy,
+            check_runner,
+            Some(Arc::new(move || for_checks.try_acquire_check_slot())),
+        ).unwrap();
+        checks.enqueue(1, HookPhase::PostEdit, CheckKind::RustFmt, &worktree).unwrap();
+        thread::sleep(Duration::from_millis(75));
+        assert_eq!(checks.snapshot().unwrap()[0].status, CheckStatus::Queued);
+        assert_eq!(studio.active_task_count(), 1);
+        release_agent.store(true, Ordering::Release);
+        for _ in 0..200 {
+            if checks.snapshot().unwrap()[0].status == CheckStatus::Succeeded {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(checks.snapshot().unwrap()[0].status, CheckStatus::Succeeded);
+        assert!(!studio.is_active());
+        drop(checks);
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn forbids_checking_arbitrary_paths_and_disabled_recipes() {
         let (root, policy, worktree) = setup();
         let checks = CheckQueue::open(root.join("checks"), policy).unwrap();
