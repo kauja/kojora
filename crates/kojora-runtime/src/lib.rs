@@ -280,23 +280,26 @@ impl IsolatedExecutor for LocalExecutor {
 
 #[cfg(unix)]
 fn apply_process_limits(limits: ProcessLimits) -> io::Result<()> {
-    // SAFETY: the pre_exec closure is entered after fork and invokes only
-    // setrlimit syscalls on primitive numeric values.
-    unsafe fn set(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> io::Result<()> {
-        let ceiling = libc::rlimit { rlim_cur: value, rlim_max: value };
-        if libc::setrlimit(resource, &ceiling) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
     if let Some(mib) = limits.address_space_mib {
         let bytes = mib * 1024 * 1024;
-        // SAFETY: validated before command construction.
-        unsafe { set(libc::RLIMIT_AS, bytes as libc::rlim_t)?; }
+        let ceiling = libc::rlimit {
+            rlim_cur: bytes as libc::rlim_t,
+            rlim_max: bytes as libc::rlim_t,
+        };
+        // SAFETY: primitive numeric values only; called in pre_exec after fork.
+        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &ceiling) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     if let Some(seconds) = limits.cpu_seconds {
-        // SAFETY: validated before command construction.
-        unsafe { set(libc::RLIMIT_CPU, seconds as libc::rlim_t)?; }
+        let ceiling = libc::rlimit {
+            rlim_cur: seconds as libc::rlim_t,
+            rlim_max: seconds as libc::rlim_t,
+        };
+        // SAFETY: primitive numeric values only; called in pre_exec after fork.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &ceiling) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
