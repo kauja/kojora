@@ -222,7 +222,8 @@ impl LocalExecutor {
         let stdout_thread = thread::spawn(move || drain_to_log(stdout, stdout_file));
         let stderr_thread = thread::spawn(move || drain_to_log(stderr, stderr_file));
 
-        let (status, cancelled) = match wait_child(&mut child, cancellation) {
+        let output_closed = || stdout_thread.is_finished() && stderr_thread.is_finished();
+        let (status, cancelled) = match wait_child(&mut child, cancellation, output_closed) {
             Ok(result) => result,
             Err(error) => {
                 // Never abandon a live child or an undrained pipe on wait errors.
@@ -335,6 +336,7 @@ fn apply_process_limits(limits: ProcessLimits) -> io::Result<()> {
 fn wait_child(
     child: &mut Child,
     cancellation: Option<&CancellationToken>,
+    output_closed: impl Fn() -> bool,
 ) -> io::Result<(ExitStatus, bool)> {
     let Some(token) = cancellation else {
         return child.wait().map(|status| (status, false));
@@ -358,8 +360,12 @@ fn wait_child(
             }
             return child.wait().map(|status| (status, true));
         }
-        if let Some(status) = child.try_wait()? {
-            return Ok((status, false));
+        // A descendant can still own a pipe after the leader exits. Keep the
+        // group ID reserved and continue polling cancellation until output closes.
+        if output_closed() {
+            if let Some(status) = child.try_wait()? {
+                return Ok((status, false));
+            }
         }
         thread::sleep(Duration::from_millis(40));
     }
@@ -595,6 +601,32 @@ mod tests {
         let events = fs::read_to_string(outcome.run_dir.join("events.jsonl")).unwrap();
         assert!(events.contains("\"cancelled\":true"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_stops_descendants_after_the_leader_exits() {
+        let root = test_root("cancel-after-leader-exit");
+        let ready = root.join("ready");
+        let mut request = request(&root, "/bin/sleep 5 & : > \"$1\"; exit 0");
+        request
+            .args
+            .extend([OsString::from("test"), ready.clone().into_os_string()]);
+        let token = CancellationToken::default();
+        let copy = token.clone();
+        let worker =
+            thread::spawn(move || LocalExecutor.run_isolated_cancellable(&request, &[], &copy));
+        let startup = Instant::now();
+        while !ready.exists() && startup.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        thread::sleep(Duration::from_millis(250));
+        token.cancel();
+        let outcome = worker.join().unwrap().expect("cancellation result");
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.cancelled);
+        assert!(!outcome.success);
     }
 
     #[test]
