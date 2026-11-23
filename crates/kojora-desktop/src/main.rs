@@ -8,7 +8,10 @@ use kojora_studio::{
     worker::StudioConnection,
     AgentMode, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
+use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -45,10 +48,10 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(root: PathBuf, socket: Option<PathBuf>) -> Self {
-        let result = match socket {
-            Some(socket) => StudioConnection::connect_worker(socket),
-            None => StudioConnection::open_local(root),
+    fn new(target: LaunchTarget) -> Self {
+        let result = match target {
+            LaunchTarget::Worker(socket) => StudioConnection::connect_worker(socket),
+            LaunchTarget::Local(root) => StudioConnection::open_local(root),
         };
         let (studio, error) = match result {
             Ok(studio) => (Some(Arc::new(studio)), None),
@@ -837,58 +840,109 @@ fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
     ui.colored_label(color, status.label());
 }
 
-fn main() -> eframe::Result<()> {
-    let mut data_dir = match default_data_dir() {
-        Ok(dir) => dir,
+const USAGE: &str =
+    "Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]";
+
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchTarget {
+    Local(PathBuf),
+    Worker(PathBuf),
+}
+
+fn launch_target(
+    mut args: impl Iterator<Item = OsString>,
+    default_path: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<Option<LaunchTarget>> {
+    let mut data_dir = None;
+    let mut worker_socket = None;
+    while let Some(arg) = args.next() {
+        let destination = match arg.to_string_lossy().as_ref() {
+            "--data-dir" => &mut data_dir,
+            "--worker-socket" => &mut worker_socket,
+            "-h" | "--help" => return Ok(None),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument {arg:?}; run kojora-desktop --help"),
+                ))
+            }
+        };
+        let path = args.next().map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{arg:?} requires an absolute path"),
+            )
+        })?;
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{arg:?} requires an absolute path"),
+            ));
+        }
+        *destination = Some(path);
+    }
+    let target = match worker_socket {
+        Some(socket) => LaunchTarget::Worker(socket),
+        None => LaunchTarget::Local(data_dir.map_or_else(default_path, Ok)?),
+    };
+    Ok(Some(target))
+}
+
+fn main() -> ExitCode {
+    let target = match launch_target(std::env::args_os().skip(1), default_data_dir) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(error) => {
-            eprintln!("Could not determine studio data directory: {error}");
-            return Ok(());
+            eprintln!("kojora-desktop: {error}");
+            return ExitCode::FAILURE;
         }
     };
-    let mut worker_socket = None;
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.to_string_lossy().as_ref() {
-            "--data-dir" => match args.next() {
-                Some(path) => data_dir = PathBuf::from(path),
-                None => {
-                    eprintln!("--data-dir requires an absolute directory");
-                    return Ok(());
-                }
-            },
-            "--worker-socket" => match args.next() {
-                Some(path) => worker_socket = Some(PathBuf::from(path)),
-                None => {
-                    eprintln!("--worker-socket requires an absolute socket path");
-                    return Ok(());
-                }
-            },
-            _ => {
-                eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]");
-                return Ok(());
-            }
-        }
-    }
-    if !data_dir.is_absolute() || worker_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
-        eprintln!("Data directory and worker socket paths must be absolute");
-        return Ok(());
-    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1250.0, 800.0])
             .with_min_inner_size([940.0, 650.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    match eframe::run_native(
         "Kojora Studio",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_cjk_fallback(&cc.egui_ctx);
-            Ok(Box::new(DesktopApp::new(
-                data_dir.clone(),
-                worker_socket.clone(),
-            )))
+            Ok(Box::new(DesktopApp::new(target)))
         }),
-    )
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("kojora-desktop: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_directory_and_socket_do_not_require_a_default() {
+        let unavailable = || Err(io::Error::new(io::ErrorKind::NotFound, "HOME is unset"));
+        for (flag, target) in [
+            ("--data-dir", LaunchTarget::Local("/tmp/kojora".into())),
+            (
+                "--worker-socket",
+                LaunchTarget::Worker("/tmp/kojora".into()),
+            ),
+        ] {
+            let result = launch_target(
+                [flag, "/tmp/kojora"].into_iter().map(OsString::from),
+                unavailable,
+            );
+            assert!(matches!(result, Ok(Some(actual)) if actual == target));
+        }
+        assert!(launch_target(std::iter::empty(), unavailable).is_err());
+    }
 }

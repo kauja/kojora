@@ -9,9 +9,13 @@ use kojora_studio::{
     worker::{serve_with_checks, WorkerClient},
     Studio,
 };
-use std::env;
 use std::io;
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -20,87 +24,108 @@ enum Mode {
     Stop,
 }
 
-fn parse() -> io::Result<(PathBuf, ProcessLimits, Mode, AdmissionPolicy, CheckPolicy)> {
-    let mut data_dir = default_data_dir()?;
+const USAGE: &str = "Usage: kojora-worker [OPTIONS]
+
+  --data-dir ABSOLUTE_DIR           Worker state and socket directory
+  --address-space-mib N             Per-process virtual memory ceiling
+  --cpu-seconds N                   Per-process CPU time ceiling
+  --max-parallel N                  Maximum concurrent agent tasks
+  --memory-reservation-mib N        Memory reserved per task
+  --total-memory-reservation-mib N  Total admission budget
+  --enable-checks                   Enable local checks on trusted worktrees
+  --post-edit-check PRESET          Queue a preset after a successful edit
+  --pre-merge-check PRESET          Allow an explicitly requested pre-merge preset
+  --check-timeout-seconds N         Wall-clock limit per check
+  --max-pending-checks N            Maximum queued and running checks
+  --status                          Show the running Worker status
+  --stop                            Stop an idle Worker
+  -h, --help                        Show this help
+
+Presets: rustfmt, clippy, test, ruff, biome";
+
+fn parse_number<T: FromStr>(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &OsStr,
+) -> io::Result<T> {
+    args.next()
+        .and_then(|value| value.to_str()?.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{flag:?} requires a number"),
+            )
+        })
+}
+
+fn parse(
+    mut args: impl Iterator<Item = OsString>,
+) -> io::Result<(PathBuf, ProcessLimits, Mode, AdmissionPolicy, CheckPolicy)> {
+    let mut data_dir = None;
     let mut limits = ProcessLimits::default();
     let mut admission = AdmissionPolicy::single();
     let mut checks = CheckPolicy::default();
     let mut mode = Mode::Serve;
-    let mut args = env::args_os().skip(1);
     while let Some(argument) = args.next() {
         match argument.to_string_lossy().as_ref() {
             "--data-dir" => {
-                data_dir = PathBuf::from(args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--data-dir requires a path"))?);
+                data_dir = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--data-dir requires a path")
+                })?));
             }
             "--address-space-mib" => {
-                let text = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--address-space-mib requires a number"))?;
-                limits.address_space_mib = Some(text.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid memory ceiling"))?);
+                limits.address_space_mib = Some(parse_number(&mut args, &argument)?)
             }
-            "--cpu-seconds" => {
-                let text = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--cpu-seconds requires a number"))?;
-                limits.cpu_seconds = Some(text.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid CPU-seconds ceiling"))?);
-            }
-            "--max-parallel" => {
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--max-parallel needs a number"))?;
-                admission.max_parallel = value.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid max-parallel"))?;
-            }
+            "--cpu-seconds" => limits.cpu_seconds = Some(parse_number(&mut args, &argument)?),
+            "--max-parallel" => admission.max_parallel = parse_number(&mut args, &argument)?,
             "--memory-reservation-mib" => {
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--memory-reservation-mib needs a number"))?;
-                admission.memory_mib_per_task = value.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid memory reservation"))?;
+                admission.memory_mib_per_task = parse_number(&mut args, &argument)?
             }
             "--total-memory-reservation-mib" => {
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "--total-memory-reservation-mib needs a number"))?;
-                admission.total_memory_mib = value.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid total memory reservation"))?;
+                admission.total_memory_mib = parse_number(&mut args, &argument)?
             }
             "--enable-checks" => checks.enabled = true,
             "--post-edit-check" | "--pre-merge-check" => {
                 let flag = argument.to_string_lossy();
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "check flag requires a preset name"))?;
+                let value = args.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "check flag requires a preset name",
+                    )
+                })?;
                 let kind = match value.to_string_lossy().as_ref() {
                     "rustfmt" => CheckKind::RustFmt,
                     "clippy" => CheckKind::RustClippy,
                     "test" => CheckKind::RustTest,
                     "ruff" => CheckKind::Ruff,
                     "biome" => CheckKind::Biome,
-                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        "check must be rustfmt, clippy, test, ruff or biome")),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "check must be rustfmt, clippy, test, ruff or biome",
+                        ))
+                    }
                 };
                 if flag == "--post-edit-check" {
-                    if !checks.post_edit.contains(&kind) { checks.post_edit.push(kind); }
+                    if !checks.post_edit.contains(&kind) {
+                        checks.post_edit.push(kind);
+                    }
                 } else if !checks.pre_merge.contains(&kind) {
                     checks.pre_merge.push(kind);
                 }
             }
-            "--check-timeout-seconds" => {
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing check timeout"))?;
-                checks.timeout_secs = value.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid check timeout"))?;
-            }
-            "--max-pending-checks" => {
-                let value = args.next().ok_or_else(||
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing check queue limit"))?;
-                checks.max_pending = value.to_string_lossy().parse().map_err(|_|
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid check queue limit"))?;
-            }
+            "--check-timeout-seconds" => checks.timeout_secs = parse_number(&mut args, &argument)?,
+            "--max-pending-checks" => checks.max_pending = parse_number(&mut args, &argument)?,
             "--status" if mode == Mode::Serve => mode = Mode::Status,
             "--stop" if mode == Mode::Serve => mode = Mode::Stop,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "usage: kojora-worker [--data-dir ABSOLUTE_DIR] [--address-space-mib N] [--cpu-seconds N] [--status|--stop]")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument {:?}; run kojora-worker --help", argument),
+                ))
+            }
         }
     }
+    let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
     if !data_dir.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -121,7 +146,15 @@ fn parse() -> io::Result<(PathBuf, ProcessLimits, Mode, AdmissionPolicy, CheckPo
 }
 
 fn run() -> io::Result<()> {
-    let (root, limits, mode, admission, checks) = parse()?;
+    let mut args = env::args_os().skip(1).peekable();
+    if args
+        .peek()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let (root, limits, mode, admission, checks) = parse(args)?;
     let socket = root.join("worker.sock");
     match mode {
         Mode::Serve => {

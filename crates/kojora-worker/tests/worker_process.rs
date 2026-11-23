@@ -25,6 +25,19 @@ impl Drop for WorkerGuard {
 }
 
 #[test]
+fn worker_help_is_available_without_home() {
+    let result = Command::new(env!("CARGO_BIN_EXE_kojora-worker"))
+        .arg("--help")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let help = String::from_utf8(result.stdout).unwrap();
+    assert!(help.contains("--data-dir"));
+    assert!(help.contains("--enable-checks"));
+}
+
+#[test]
 fn worker_process_runs_account_profiles_and_outlives_clients() {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -62,6 +75,7 @@ printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}
             "--cpu-seconds",
             "120",
         ])
+        .env_remove("HOME")
         .env("PATH", &bin_dir)
         .env("ANTHROPIC_API_KEY", "test-parent-secret")
         .stdin(Stdio::null())
