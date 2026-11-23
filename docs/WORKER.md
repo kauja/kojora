@@ -19,6 +19,12 @@ Codex CLI must be installed and its private profile initialized separately.
 The example uses an explicit directory on both Linux/macOS; on macOS
 the legacy standalone GUI default is a different state directory.
 
+The Worker defaults to one active task. Use distinct account profiles and
+set `--max-parallel 2 --memory-reservation-mib 512
+--total-memory-reservation-mib 1024` with an explicit address-space ceiling
+to allow two tasks. The Desktop displays the available task slots. Select
+a running task to stop that specific run.
+
 ## API and security boundary
 
 - Only a private owner-only Unix-domain socket in a 0700 Studio directory.
@@ -44,7 +50,7 @@ the legacy standalone GUI default is a different state directory.
 | --- | --- | --- | --- |
 | `--address-space-mib N` | Unix RLIMIT_AS | Virtual memory address space for each child | Physical RSS, group or host total |
 | `--cpu-seconds N` | Unix RLIMIT_CPU | CPU time of each child | Elapsed wall time, aggregate CPU across children |
-| Single running task | Studio single-flight admission | At most one active task | Multi-agent queueing or other host processes |
+| `--max-parallel N` and memory reservations | Studio admission | Active task count and configured reservation budget | Operating system memory use or other host processes |
 
 The numeric limits are optional; without them the Worker does not apply
 process-specific memory/CPU ceilings. RLIMIT_AS can prevent a provider from
@@ -68,7 +74,7 @@ aggregate RSS/CPU quota, cgroup containment or fair queue scheduling.
 ## Known limitations
 
 - The Worker outlives the GUI, **not** its own crash or machine reboot.
-- No task queue, multiple concurrent agents, remote TLS/mTLS, automatic
+- No waiting task queue, remote TLS/mTLS, automatic
   service installation, or full process-tree RSS/CPU pressure telemetry.
 - Abnormally terminated Worker processes can leave orphan Codex processes.
   Startup records incomplete tasks as Interrupted, but cannot kill orphans.

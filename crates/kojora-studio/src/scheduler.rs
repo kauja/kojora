@@ -92,6 +92,14 @@ impl Scheduler {
         self.tasks.keys().copied().collect()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn active_task_statuses(&self) -> Vec<(u64, bool)> {
+        self.tasks
+            .iter()
+            .map(|(&task_id, slot)| (task_id, slot.token.is_cancelled()))
+            .collect()
+    }
+
     pub fn active_count(&self) -> usize {
         self.tasks.len()
     }
