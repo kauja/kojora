@@ -8,6 +8,8 @@ use kojora_studio::{
     worker::{StudioConnection, WorkerStatus},
     AgentMode, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
+use std::borrow::Cow;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
@@ -40,6 +42,7 @@ struct DesktopApp {
     selected_task: Option<u64>,
     inspector_output: InspectorOutput,
     history_page: usize,
+    completed_responses: BTreeMap<u64, String>,
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
@@ -71,6 +74,7 @@ impl DesktopApp {
             selected_task: None,
             inspector_output: InspectorOutput::default(),
             history_page: 0,
+            completed_responses: BTreeMap::new(),
             adding_bot: false,
             new_bot_name: String::new(),
             new_workspace: std::env::current_dir()
@@ -326,7 +330,9 @@ impl DesktopApp {
             }
         });
         let end = tasks.len().saturating_sub(self.history_page * 60);
-        let start = end.saturating_sub(60);
+        let page = &tasks[end.saturating_sub(60)..end];
+        self.completed_responses
+            .retain(|id, _| page.iter().any(|task| task.id == *id));
 
         egui::ScrollArea::vertical()
             .id_salt(("conversation", self.history_page))
@@ -340,7 +346,7 @@ impl DesktopApp {
                         ui.label("Describe what you want the agent to inspect.");
                     });
                 }
-                for task in &tasks[start..end] {
+                for task in page {
                     let selected = self.selected_task == Some(task.id);
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -360,12 +366,7 @@ impl DesktopApp {
                                     .small(),
                             );
                         }
-                        let response = self
-                            .studio
-                            .as_ref()
-                            .and_then(|studio| studio.read_log_tail(task.id, false).ok())
-                            .map(|raw| bot.provider.extract_text(&raw))
-                            .unwrap_or_default();
+                        let response = self.conversation_response(task, bot.provider);
                         if !response.is_empty() {
                             ui.separator();
                             ui.label(
@@ -397,6 +398,33 @@ impl DesktopApp {
                     ui.add_space(10.0);
                 }
             });
+    }
+
+    fn conversation_response(
+        &mut self,
+        task: &TaskRecord,
+        provider: AgentProvider,
+    ) -> Cow<'_, str> {
+        let read = || {
+            self.studio
+                .as_ref()?
+                .read_log_tail(task.id, false)
+                .ok()
+                .map(|raw| provider.extract_text(&raw))
+        };
+        if matches!(
+            task.status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return match self.completed_responses.entry(task.id) {
+                Entry::Occupied(response) => Cow::Borrowed(response.into_mut()),
+                Entry::Vacant(slot) => match read() {
+                    Some(response) => Cow::Borrowed(slot.insert(response)),
+                    None => Cow::Borrowed(""),
+                },
+            };
+        }
+        Cow::Owned(read().unwrap_or_default())
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
