@@ -1,88 +1,77 @@
-# Experimental Codex CLI adapter
+# Agent adapters and account profiles
 
-Kojora now has a provider-neutral internal `AgentAdapter` trait and a
-one-shot, **read-only** Codex CLI adapter. It builds a structured command,
-then delegates to the same bounded-memory process runner as `kojora run`.
+Kojora can launch Codex and Claude Code from the CLI, the desktop, or the
+local Worker. Each Bot stores a provider and a path to an account profile.
+The profile stays on the machine that runs the agent.
 
-This is a bootstrap. It is **not a daemon, task scheduler, external plugin
-ABI, untrusted-code sandbox, or resumable agent session**.
+| Provider | CLI selector | Profile variable | Modes |
+| --- | --- | --- | --- |
+| Codex | `codex` | `CODEX_HOME` | Inspection and confirmed worktree edits |
+| Claude Code 2.1.248 or later | `claude-code` | `CLAUDE_CONFIG_DIR` | Restricted inspection |
 
-## Requirements
+Install the official provider CLI on the Worker's PATH. Use a private,
+owner-only directory for each signed-in account, outside every repository
+and worktree. For example, initialize two Claude Code accounts separately:
 
-- Rust stable.
-- The official `codex` CLI installed in your PATH.
-- A user-controlled credential profile already logged in to Codex.
-- A separate profile per active agent identity. Concurrent Kojora use of the
-  *same* profile is refused with a private exclusive lock file.
-
-## Setup
-
-Initialize a dedicated profile **outside the source workspace**:
-
-```bash
-mkdir -p "$HOME/.config/kojora/profiles"
-mkdir -m 700 "$HOME/.config/kojora/profiles/codex-primary"
-CODEX_HOME="$HOME/.config/kojora/profiles/codex-primary" codex login
+```sh
+profiles="$HOME/.config/kojora/profiles"
+mkdir -p "$profiles"
+mkdir -m 700 "$profiles/claude-personal" "$profiles/claude-work"
+CLAUDE_CONFIG_DIR="$profiles/claude-personal" claude auth login
+CLAUDE_CONFIG_DIR="$profiles/claude-work" claude auth login
+CLAUDE_CONFIG_DIR="$profiles/claude-personal" claude auth status
+CLAUDE_CONFIG_DIR="$profiles/claude-work" claude auth status
 ```
 
-Do not put credentials inside the repository or a Git worktree. Do not copy
-secrets or OAuth files into Kojora's source tree.
+In Desktop, create two Bots with provider **Claude Code**, the desired
+workspace, and the two distinct absolute profile paths. Select a Bot to
+switch accounts. For the CLI, select the account with `--profile`:
 
-## Run
-
-```bash
-cargo run -p kojora-cli -- agent codex \
-  --profile "$HOME/.config/kojora/profiles/codex-primary" \
-  --cwd "$PWD" \
-  -- "Summarize the architecture of this Rust workspace"
+```sh
+cargo run --locked -p kojora-cli -- agent claude-code \
+  --profile "$profiles/claude-work" --cwd "$PWD" \
+  -- "Summarize the architecture of this workspace"
 ```
 
-The adapter invokes:
+For Codex, use a separate profile and sign in with the official CLI:
 
-```text
-codex exec --json --sandbox read-only --ignore-user-config -- PROMPT
+```sh
+mkdir -m 700 "$profiles/codex-primary"
+CODEX_HOME="$profiles/codex-primary" codex login
+cargo run --locked -p kojora-cli -- agent codex \
+  --profile "$profiles/codex-primary" --cwd "$PWD" \
+  -- "Summarize the architecture of this workspace"
 ```
 
-The prompt is passed as a literal argument, not shell-evaluated. Agent stdin
-is detached (EOF) so unattended runs cannot wait for input from the parent.
-It uses
-`CODEX_HOME` and `HOME` set to the canonical private profile directory;
-the child process also receives `PATH` and optional `LANG`. **All other
-parent environment variables are cleared**, including API keys and
-`GITHUB_TOKEN`.
+## Execution and verification
 
-The private run directory contains stdout JSONL events, stderr and lifecycle
-events. Kojora does not print the prompt or provider credentials in its
-`events.jsonl`. Agent-produced logs may still contain sensitive content.
+- A run receives the canonical account directory as `HOME` and as the
+  provider's profile variable. Kojora additionally passes `PATH` and
+  optional `LANG`. Parent API keys and tokens stay out of the child
+  environment. Login and credential storage are handled by the provider CLI.
+- The account directory must be a real private directory. The executor
+  holds an exclusive lease through process exit and output collection.
+  After a crash, remove a stale `.kojora-agent.lock` only after verifying
+  that the original agent has stopped.
+- The Claude Code adapter uses `--restricted` and allows Read, Glob, and
+  Grep. It disables MCP tools, hooks, skills, Chrome integration, and session
+  persistence for the run. Use trusted repositories and managed settings.
+- The process runner records start, exit, cancellation, and bounded-memory
+  output collection. Inspect the private run directory for stderr and raw
+  JSONL. Agent output can contain sensitive project information.
+- CI tests launch a fixture through the real Kojora CLI and verify that two
+  account profiles receive distinct paths and that parent secrets are
+  cleared. Provider login and Keychain behavior require a signed-in smoke
+  test on the target machine.
 
-The CLI returns the provider's exit status. A nonzero result is an outcome,
-not proof of a failed process launch.
+## Adapter extension points
 
-## Security boundaries
+Implement `AgentAdapter` in `kojora-agents` and register the provider's
+inspection and optional edit adapters on `AgentProvider`. Adapters declare
+capabilities, construct literal argv, select the profile variable, and
+extract user-facing responses from JSON events. The process executor owns
+environment clearing and cancellation. The Studio runner is injectable for
+tests or embeddings through `Studio::open_with_runner`. The Rust interfaces
+are experimental.
 
-- The profile must already exist, be an actual (non-symlink) directory and
-  have mode 0700 on Unix.
-- A private `.kojora-agent.lock` is acquired using an exclusive file
-  creation operation; another Kojora process cannot use that profile at
-  the same time.
-- A crash can leave a stale lock: **verify the original agent has stopped**
-  before removing it manually.
-- The workspace and credential profile may not overlap.
-- The CLI explicitly requests the provider's read-only sandbox, but that
-  does **not** replace OS-level isolation or a trusted workspace policy.
-- Project instructions, hooks, provider settings and tool/MCP integrations
-  may have their own behaviors. Do not run this against untrusted projects.
-- No automatic login, secret copying, token refresh interception, quota
-  circumvention or elevated agent permissions are implemented.
-- No live Codex credential/integration test is run in GitHub Actions.
-
-## Future work
-
-1. Structured event parsing into typed tasks, runs and sessions.
-2. Explicit human-approved edit mode and Git worktree isolation.
-3. Provider adapters for Claude Code and remote worker processes.
-4. Cancellation, reconciliation after crashes and resource budgets.
-
-References:
-- [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference)
-- [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+[Codex CLI reference](https://developers.openai.com/codex/cli/reference) · [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference) · [Claude Code authentication](https://code.claude.com/docs/en/authentication)

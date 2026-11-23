@@ -1,4 +1,4 @@
-use kojora_agents::{run_agent, AgentRequest, CodexExecAdapter};
+use kojora_agents::{run_agent, AgentProvider, AgentRequest};
 use kojora_runtime::{Executor, LocalExecutor, RunSpec};
 use std::env;
 use std::ffi::OsString;
@@ -13,8 +13,8 @@ fn print_help() {
     println!("Commands:");
     println!("  run [--cwd DIR] [--log-root DIR] -- PROGRAM [ARG ...]");
     println!("               Run one trusted command and save output and events");
-    println!("  agent codex --profile DIR [--cwd DIR] [--log-root DIR] -- PROMPT");
-    println!("               Run Codex once in read-only mode with an isolated profile");
+    println!("  agent <codex|claude-code> --profile DIR [--cwd DIR] [--log-root DIR] -- PROMPT");
+    println!("               Run an inspection task with a private account profile");
     println!("  doctor       Show current implementation status");
     println!("  version      Print the version");
     println!("  help         Show this help message");
@@ -77,9 +77,11 @@ fn run(args: &[OsString]) -> Result<ExitCode, String> {
 }
 
 fn agent(args: &[OsString]) -> Result<ExitCode, String> {
-    if args.first().map(OsString::as_os_str) != Some(std::ffi::OsStr::new("codex")) {
-        return Err("only 'agent codex' is implemented".to_owned());
-    }
+    let provider = args
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or("expected an agent provider")?
+        .parse::<AgentProvider>()?;
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
     let mut profile = None;
     let mut log_root = None;
@@ -116,7 +118,7 @@ fn agent(args: &[OsString]) -> Result<ExitCode, String> {
         }
     }
 
-    let profile = profile.ok_or("agent codex requires --profile DIR")?;
+    let profile = profile.ok_or("agent requires --profile DIR")?;
     let prompt = args.get(index).ok_or("expected a prompt after --")?;
     if args.len() != index + 1 {
         return Err("quote the entire prompt as one argument".to_owned());
@@ -125,7 +127,7 @@ fn agent(args: &[OsString]) -> Result<ExitCode, String> {
     let root = log_root.unwrap_or_else(|| cwd.join(".kojora").join("runs"));
 
     let outcome = run_agent(
-        &CodexExecAdapter,
+        provider.inspect_adapter(),
         &LocalExecutor,
         &AgentRequest {
             prompt,
@@ -166,9 +168,9 @@ fn main() -> ExitCode {
         }
         Some(value) if value == "doctor" => {
             println!("Kojora process runner: available (local, synchronous, no sandbox)");
-            println!("Agent adapters: Codex CLI read-only, one-shot (experimental)");
-            println!("Headless daemon / API: not implemented");
-            println!("GUI: not implemented");
+            println!("Agent adapters: Codex and Claude Code inspection");
+            println!("Headless daemon: kojora-worker (local Unix socket)");
+            println!("Desktop: kojora-desktop (standalone or connected to Worker)");
             ExitCode::SUCCESS
         }
         Some(value) if value == "agent" => match agent(&args[1..]) {

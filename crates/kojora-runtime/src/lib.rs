@@ -177,7 +177,7 @@ impl LocalExecutor {
         }
         #[cfg(unix)]
         if limits.address_space_mib.is_some() || limits.cpu_seconds.is_some() {
-            // pre_exec only calls async-signal-safe setrlimit syscall(s).
+            // SAFETY: pre_exec only calls async-signal-safe setrlimit syscall(s).
             // No allocations, mutexes or Rust runtimes are touched in child.
             unsafe {
                 command.pre_exec(move || apply_process_limits(limits));
@@ -212,8 +212,13 @@ impl LocalExecutor {
             return Err(error);
         }
 
-        let stdout = child.stdout.take().expect("piped stdout must exist");
-        let stderr = child.stderr.take().expect("piped stderr must exist");
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(
+                "child process output pipes are unavailable",
+            ));
+        };
         let stdout_thread = thread::spawn(move || drain_to_log(stdout, stdout_file));
         let stderr_thread = thread::spawn(move || drain_to_log(stderr, stderr_file));
 
@@ -472,6 +477,12 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(all(test, unix))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;

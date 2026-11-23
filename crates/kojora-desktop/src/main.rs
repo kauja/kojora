@@ -4,9 +4,9 @@
 use eframe::egui;
 use kojora_studio::{
     checks::{CheckKind, HookPhase},
-    default_data_dir, extract_agent_text,
+    default_data_dir,
     worker::StudioConnection,
-    AgentMode, StudioState, TaskRecord, TaskStatus,
+    AgentMode, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -32,6 +32,7 @@ struct DesktopApp {
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
+    new_provider: AgentProvider,
     new_profile: String,
     prompt: String,
     notice: String,
@@ -45,9 +46,6 @@ struct DesktopApp {
 
 impl DesktopApp {
     fn new(root: PathBuf, socket: Option<PathBuf>) -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
         let result = match socket {
             Some(socket) => StudioConnection::connect_worker(socket),
             None => StudioConnection::open_local(root),
@@ -69,13 +67,8 @@ impl DesktopApp {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            new_profile: home
-                .join(".config")
-                .join("kojora")
-                .join("profiles")
-                .join("codex-primary")
-                .to_string_lossy()
-                .into_owned(),
+            new_provider: AgentProvider::default(),
+            new_profile: String::new(),
             prompt: String::new(),
             notice: String::new(),
             show_stderr: false,
@@ -91,10 +84,11 @@ impl DesktopApp {
         let Some(studio) = &self.studio else {
             return;
         };
-        match studio.add_bot(
+        match studio.add_bot_with_provider(
             &self.new_bot_name,
             PathBuf::from(&self.new_workspace),
             PathBuf::from(&self.new_profile),
+            self.new_provider,
         ) {
             Ok(id) => {
                 self.selected_bot = Some(id);
@@ -102,8 +96,9 @@ impl DesktopApp {
                 self.history_page = 0;
                 self.adding_bot = false;
                 self.new_bot_name.clear();
-                self.notice =
-                    "Bot created. Configure an authenticated Codex profile before running.".into();
+                self.new_profile.clear();
+                self.edit_mode = false;
+                self.notice = "Bot created.".into();
             }
             Err(error) => self.notice = format!("Could not create bot: {error}"),
         }
@@ -169,9 +164,10 @@ impl DesktopApp {
                         self.history_page = 0;
                         self.show_stderr = false;
                         self.show_raw_events = false;
+                        self.edit_mode = false;
                     }
                     ui.label(
-                        egui::RichText::new(format!("     Codex · #{}", bot.id))
+                        egui::RichText::new(format!("     {} · #{}", bot.provider.label(), bot.id))
                             .weak()
                             .small(),
                     );
@@ -184,7 +180,18 @@ impl DesktopApp {
                     ui.text_edit_singleline(&mut self.new_bot_name);
                     ui.label("Workspace (absolute path)");
                     ui.text_edit_singleline(&mut self.new_workspace);
-                    ui.label("Codex profile (absolute path)");
+                    egui::ComboBox::from_id_salt("new-bot-provider")
+                        .selected_text(self.new_provider.label())
+                        .show_ui(ui, |ui| {
+                            for provider in AgentProvider::ALL {
+                                ui.selectable_value(
+                                    &mut self.new_provider,
+                                    provider,
+                                    provider.label(),
+                                );
+                            }
+                        });
+                    ui.label("Account profile (absolute path)");
                     ui.text_edit_singleline(&mut self.new_profile);
                     ui.label(
                         egui::RichText::new(
@@ -200,11 +207,6 @@ impl DesktopApp {
             });
 
         ui.separator();
-        ui.label(
-            egui::RichText::new("Read-only agent · 1 active run")
-                .small()
-                .weak(),
-        );
         if let Some(studio) = &self.studio {
             ui.label(
                 egui::RichText::new(studio.data_dir().to_string_lossy().to_string())
@@ -263,19 +265,16 @@ impl DesktopApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(95.0);
                 ui.heading("Your software factory starts with a Bot");
-                ui.label("Create a Bot, select a workspace and Codex profile, then send a task.");
+                ui.label("Create a Bot, select a provider and account profile, then send a task.");
             });
             return;
         };
 
-        let bot = state.bots.iter().find(|bot| bot.id == bot_id);
-        if let Some(bot) = bot {
-            ui.label(
-                egui::RichText::new(format!("Workspace: {}", bot.workspace.to_string_lossy()))
-                    .small()
-                    .weak(),
-            );
-        }
+        let Some(bot) = state.bots.iter().find(|bot| bot.id == bot_id) else {
+            return;
+        };
+        ui.small(format!("Workspace: {}", bot.workspace.display()));
+        ui.small(format!("Account profile: {}", bot.profile_dir.display()));
         ui.separator();
 
         let tasks: Vec<&TaskRecord> = state
@@ -317,7 +316,7 @@ impl DesktopApp {
                     ui.add_space(60.0);
                     ui.vertical_centered(|ui| {
                         ui.heading("No tasks yet");
-                        ui.label("Describe what you want Codex to inspect.");
+                        ui.label("Describe what you want the agent to inspect.");
                     });
                 }
                 for task in &tasks[start..end] {
@@ -344,11 +343,15 @@ impl DesktopApp {
                             .studio
                             .as_ref()
                             .and_then(|studio| studio.read_log_tail(task.id, false).ok())
-                            .map(|raw| extract_agent_text(&raw))
+                            .map(|raw| bot.provider.extract_text(&raw))
                             .unwrap_or_default();
                         if !response.is_empty() {
                             ui.separator();
-                            ui.label(egui::RichText::new("Codex").color(COLOR_ACCENT).strong());
+                            ui.label(
+                                egui::RichText::new(bot.provider.label())
+                                    .color(COLOR_ACCENT)
+                                    .strong(),
+                            );
                             ui.label(response);
                         } else if task.status == TaskStatus::Running {
                             ui.horizontal(|ui| {
@@ -358,9 +361,9 @@ impl DesktopApp {
                                     .as_ref()
                                     .is_some_and(|studio| studio.cancellation_requested(task.id));
                                 ui.label(if stopping {
-                                    "Stopping Codex and collecting logs..."
+                                    "Stopping the agent and collecting logs..."
                                 } else {
-                                    "Codex is processing this task..."
+                                    "The agent is processing this task..."
                                 });
                             });
                         } else {
@@ -515,7 +518,12 @@ impl DesktopApp {
                         && !self.show_stderr
                         && !self.show_raw_events
                     {
-                        let text = extract_agent_text(&raw);
+                        let provider = state
+                            .bots
+                            .iter()
+                            .find(|bot| bot.id == task.bot_id)
+                            .map_or(AgentProvider::default(), |bot| bot.provider);
+                        let text = provider.extract_text(&raw);
                         if text.is_empty() {
                             raw
                         } else {
@@ -612,13 +620,22 @@ impl DesktopApp {
         ui.ctx().request_repaint();
     }
 
-    fn composer(&mut self, ui: &mut egui::Ui) {
+    fn composer(&mut self, ui: &mut egui::Ui, state: &StudioState) {
+        let provider = state
+            .bots
+            .iter()
+            .find(|bot| Some(bot.id) == self.selected_bot)
+            .map_or(AgentProvider::default(), |bot| bot.provider);
+        let supports_edits = provider.edit_adapter().is_some();
+        if !supports_edits {
+            self.edit_mode = false;
+        }
         let active = self
             .studio
             .as_deref()
             .is_some_and(|studio| studio.is_active());
         ui.horizontal(|ui| {
-            ui.colored_label(COLOR_ACCENT, "Codex");
+            ui.colored_label(COLOR_ACCENT, provider.label());
             ui.label(
                 egui::RichText::new(if self.edit_mode {
                     "Isolated worktree · workspace-write · opt-in"
@@ -629,10 +646,12 @@ impl DesktopApp {
                 .small(),
             );
         });
-        ui.checkbox(
-            &mut self.edit_mode,
-            "Allow edits in a separate Git worktree",
-        );
+        if supports_edits {
+            ui.checkbox(
+                &mut self.edit_mode,
+                "Allow edits in a separate Git worktree",
+            );
+        }
         if self.edit_mode {
             ui.colored_label(
                 COLOR_ERROR,
@@ -640,7 +659,7 @@ impl DesktopApp {
             );
         }
         let edit = egui::TextEdit::multiline(&mut self.prompt)
-            .hint_text("Ask Codex to inspect your project, explain an issue, or propose a plan...")
+            .hint_text("Ask the agent to inspect your project or explain an issue…")
             .desired_rows(3);
         ui.add_enabled(!active && self.selected_bot.is_some(), edit);
         ui.horizontal(|ui| {
@@ -694,7 +713,10 @@ impl eframe::App for DesktopApp {
             return;
         }
 
-        let state = match self.studio.as_ref().expect("checked above").snapshot() {
+        let Some(studio) = &self.studio else {
+            return;
+        };
+        let state = match studio.snapshot() {
             Ok(state) => state,
             Err(error) => {
                 self.notice = error.to_string();
@@ -731,7 +753,7 @@ impl eframe::App for DesktopApp {
             .min_height(130.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui));
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, &state));
                 ui.add_space(7.0);
             });
 

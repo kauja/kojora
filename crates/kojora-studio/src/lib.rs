@@ -1,5 +1,5 @@
 //! Headless local studio control plane: durable bot/task/run records.
-//! No UI framework is used here. Execution is single-flight on purpose.
+//! No UI framework is used here. Admission and execution are independent of the provider.
 
 pub mod checks;
 pub mod scheduler;
@@ -9,11 +9,11 @@ pub mod worker;
 use scheduler::{AdmissionPolicy, Scheduler};
 
 use fs2::FileExt;
+pub use kojora_agents::AgentProvider;
 use kojora_agents::{
-    run_agent_cancellable, run_agent_cancellable_limited, AgentRequest, CodexExecAdapter,
-    CodexWorkspaceWriteAdapter,
+    run_agent_cancellable, run_agent_cancellable_limited, AgentAdapter, AgentRequest,
 };
-use kojora_runtime::{CancellationToken, LocalExecutor, RunOutcome};
+use kojora_runtime::{CancellationToken, LocalExecutor, ProcessLimits, RunOutcome};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -69,6 +69,8 @@ pub struct BotRecord {
     pub name: String,
     pub workspace: PathBuf,
     pub profile_dir: PathBuf,
+    #[serde(default)]
+    pub provider: AgentProvider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,79 +159,57 @@ pub struct Studio {
     _instance_lock: Arc<File>,
 }
 
+fn adapter_for(provider: AgentProvider, mode: AgentMode) -> io::Result<&'static dyn AgentAdapter> {
+    match mode {
+        AgentMode::Inspect => Ok(provider.inspect_adapter()),
+        AgentMode::EditWorktree => provider.edit_adapter().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{} does not support edit mode", provider.label()),
+            )
+        }),
+    }
+}
+
+fn local_runner(limits: Option<ProcessLimits>) -> Arc<AgentRunner> {
+    Arc::new(move |bot, prompt, log_root, mode, cancellation| {
+        let adapter = adapter_for(bot.provider, mode)?;
+        let request = AgentRequest {
+            prompt,
+            workspace: &bot.workspace,
+            profile_dir: &bot.profile_dir,
+            log_root,
+        };
+        match limits {
+            Some(limits) => run_agent_cancellable_limited(
+                adapter,
+                &LocalExecutor,
+                &request,
+                cancellation,
+                limits,
+            ),
+            None => run_agent_cancellable(adapter, &LocalExecutor, &request, cancellation),
+        }
+    })
+}
+
 impl Studio {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::open_with_runner(
-            root,
-            Arc::new(|bot, prompt, log_root, mode, cancellation| {
-                let request = AgentRequest {
-                    prompt,
-                    workspace: &bot.workspace,
-                    profile_dir: &bot.profile_dir,
-                    log_root,
-                };
-                match mode {
-                    AgentMode::Inspect => run_agent_cancellable(
-                        &CodexExecAdapter,
-                        &LocalExecutor,
-                        &request,
-                        cancellation,
-                    ),
-                    AgentMode::EditWorktree => run_agent_cancellable(
-                        &CodexWorkspaceWriteAdapter,
-                        &LocalExecutor,
-                        &request,
-                        cancellation,
-                    ),
-                }
-            }),
-        )
+        Self::open_with_runner(root, local_runner(None))
     }
 
-    /// Opens the single-instance state store with per-child OS ceilings.
-    /// Worker Daemon calls this; Desktop can continue to use unrestricted
-    /// local mode. No GUI dependencies are imported by the service.
-    pub fn open_with_limits(
-        root: impl Into<PathBuf>,
-        limits: kojora_runtime::ProcessLimits,
-    ) -> io::Result<Self> {
+    /// Open the headless Worker with per-child OS ceilings.
+    pub fn open_with_limits(root: impl Into<PathBuf>, limits: ProcessLimits) -> io::Result<Self> {
         Self::open_with_limits_and_policy(root, limits, AdmissionPolicy::single())
     }
 
     pub fn open_with_limits_and_policy(
         root: impl Into<PathBuf>,
-        limits: kojora_runtime::ProcessLimits,
+        limits: ProcessLimits,
         policy: AdmissionPolicy,
     ) -> io::Result<Self> {
         limits.validate()?;
-        Self::open_with_runner_and_policy(
-            root,
-            Arc::new(move |bot, prompt, log_root, mode, cancellation| {
-                let request = AgentRequest {
-                    prompt,
-                    workspace: &bot.workspace,
-                    profile_dir: &bot.profile_dir,
-                    log_root,
-                };
-                match mode {
-                    AgentMode::Inspect => run_agent_cancellable_limited(
-                        &CodexExecAdapter,
-                        &LocalExecutor,
-                        &request,
-                        cancellation,
-                        limits,
-                    ),
-                    AgentMode::EditWorktree => run_agent_cancellable_limited(
-                        &CodexWorkspaceWriteAdapter,
-                        &LocalExecutor,
-                        &request,
-                        cancellation,
-                        limits,
-                    ),
-                }
-            }),
-            policy,
-        )
+        Self::open_with_runner_and_policy(root, local_runner(Some(limits)), policy)
     }
 
     pub fn open_with_runner(
@@ -358,6 +338,16 @@ impl Studio {
     }
 
     pub fn add_bot(&self, name: &str, workspace: PathBuf, profile_dir: PathBuf) -> io::Result<u64> {
+        self.add_bot_with_provider(name, workspace, profile_dir, AgentProvider::default())
+    }
+
+    pub fn add_bot_with_provider(
+        &self,
+        name: &str,
+        workspace: PathBuf,
+        profile_dir: PathBuf,
+        provider: AgentProvider,
+    ) -> io::Result<u64> {
         let name = name.trim();
         if name.is_empty() || name.len() > 100 {
             return Err(io::Error::new(
@@ -379,12 +369,13 @@ impl Studio {
             name: name.to_owned(),
             workspace,
             profile_dir,
+            provider,
         });
         commit_state(&self.root, &mut state, candidate)?;
         Ok(id)
     }
 
-    /// Submit one Codex task on a background thread. At most one task runs.
+    /// Submit an inspection task on a background thread.
     pub fn submit(&self, bot_id: u64, prompt: &str) -> io::Result<u64> {
         self.submit_with_mode(bot_id, prompt, AgentMode::Inspect)
     }
@@ -406,6 +397,7 @@ impl Studio {
                 .find(|bot| bot.id == bot_id)
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bot not found"))?;
+            adapter_for(bot.provider, mode)?;
             let task_id = candidate.next_id()?;
             let run_id = candidate.next_id()?;
             let session_id = candidate.next_id()?;
@@ -669,27 +661,9 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
     }
 }
 
-/// Recover compact human-facing assistant responses from Codex JSONL output.
+/// Recover assistant responses from an existing Codex JSONL log.
 pub fn extract_agent_text(log: &str) -> String {
-    let mut messages = Vec::new();
-    for line in log.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("type").and_then(|kind| kind.as_str()) != Some("item.completed") {
-            continue;
-        }
-        let Some(item) = value.get("item") else {
-            continue;
-        };
-        if item.get("type").and_then(|kind| kind.as_str()) != Some("agent_message") {
-            continue;
-        }
-        if let Some(message) = item.get("text").and_then(|text| text.as_str()) {
-            messages.push(message.to_owned());
-        }
-    }
-    messages.join("\n\n")
+    AgentProvider::Codex.extract_text(log)
 }
 
 /// Run Git only for local trusted repositories. Never evaluate shell input.
@@ -916,6 +890,12 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1043,6 +1023,16 @@ mod tests {
     }
 
     #[test]
+    fn reads_bots_saved_before_provider_selection() {
+        let bot: BotRecord = serde_json::from_str(
+            r#"{"id":1,"name":"Existing","workspace":"/project","profile_dir":"/profile"}"#,
+        )
+        .unwrap();
+        assert_eq!(bot.provider, AgentProvider::Codex);
+        assert_eq!(bot.profile_dir, Path::new("/profile"));
+    }
+
+    #[test]
     fn edit_mode_never_mutates_original_checkout() {
         let root = temporary_root("worktree");
         let project = root.join("checkout");
@@ -1145,6 +1135,7 @@ mod tests {
             name: "X".repeat(MAX_STATE_BYTES as usize),
             workspace: root.clone(),
             profile_dir: root.clone(),
+            provider: AgentProvider::Codex,
         });
         assert!(commit_state(&root, &mut shared, candidate).is_err());
         assert!(shared.bots.is_empty());

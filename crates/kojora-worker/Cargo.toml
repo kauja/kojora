@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 kojora-studio = { path = "../kojora-studio" }
 kojora-runtime = { path = "../kojora-runtime" }
+
+[lints]
+workspace = true

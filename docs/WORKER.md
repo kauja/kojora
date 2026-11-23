@@ -24,8 +24,10 @@ the legacy standalone GUI default is a different state directory.
 - Only a private owner-only Unix-domain socket in a 0700 Studio directory.
 - The socket uses mode 0600; the client verifies socket and parent owner,
   type, and permissions before connecting. No TCP port or remote access.
-- Protocol v2 uses length-prefixed JSON frames with a 64-KiB request cap
-  and explicit bounded replies. It carries no OAuth tokens or API keys.
+- Build the Worker and Desktop from the same revision so their protocol
+  versions match.
+- Protocol v3 includes the Bot provider. It uses length-prefixed JSON frames
+  with a 64-KiB request cap and bounded replies.
 - RPC operations: status, snapshot, Bot creation, Task submission, Task
   cancellation, bounded stdout/stderr logs, bounded worktree diff,
   named local-check enqueue/status/log queries, shutdown.
