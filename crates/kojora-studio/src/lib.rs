@@ -417,7 +417,6 @@ impl Studio {
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
-                let _instance_lock = instance_lock;
                 struct ActiveGuard {
                     scheduler: Arc<Mutex<Scheduler>>,
                     task_id: u64,
@@ -430,6 +429,8 @@ impl Studio {
                     }
                 }
                 let _guard = ActiveGuard { scheduler, task_id };
+                // Release the worker's lock before the guard frees the reservation.
+                let _instance_lock = instance_lock;
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
                 let outcome = if cancellation.is_cancelled() {
                     Err(io::Error::new(
