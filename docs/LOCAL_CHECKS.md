@@ -22,10 +22,11 @@ cargo run --release -p kojora-worker -- \
 
 The `post_edit` hook automatically queues configured checks after a
 successful isolated-edit Task. The same Task/Hook/Preset combination is
-deduplicated across GUI reconnections and Worker restarts. Manual checks
-can be repeated after they finish. `pre_merge` is explicitly triggered by
-a client; it does **not** modify GitHub branch protection or install a
-repository Git hook.
+deduplicated across GUI reconnections and Worker restarts. Manual and
+`pre_merge` requests share a matching queued or running check and start a
+fresh check after completion. Clients explicitly trigger `pre_merge` against
+the current worktree. The Worker observes completed edits before accepting a
+shutdown request and waits for pending checks to finish.
 
 ## Allowlisted checks
 

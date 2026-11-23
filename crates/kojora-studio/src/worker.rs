@@ -236,10 +236,19 @@ fn dispatch(
         ),
         Request::Diff { task_id } => (Response::Text(studio.read_worktree_diff(task_id)?), false),
         Request::Shutdown => {
-            if studio.is_active() || checks.pending_count() != 0 {
+            if studio.is_active() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "worker has active tasks or checks; cancel/wait for completion",
+                    "worker has active tasks; cancel or wait for completion",
+                ));
+            }
+            if checks.has_post_edit_hooks() {
+                checks.observe_post_edit(&studio.snapshot()?);
+            }
+            if checks.pending_count() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "worker has pending checks; wait for completion",
                 ));
             }
             (Response::Ok, true)
@@ -761,6 +770,81 @@ mod tests {
                 })
             },
         )
+    }
+
+    #[test]
+    fn shutdown_observes_newly_completed_edit_tasks() {
+        let root = test_root();
+        let worktree = root.join("worktrees/task-1");
+        fs::create_dir_all(&worktree).unwrap();
+        let limits = ProcessLimits {
+            address_space_mib: Some(8192),
+            cpu_seconds: Some(60),
+        };
+        let policy = CheckPolicy {
+            enabled: true,
+            limits,
+            post_edit: vec![CheckKind::RustFmt],
+            ..CheckPolicy::default()
+        };
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let checks = CheckQueue::open_with_admission(
+            root.join("checks"),
+            policy,
+            Arc::new(move || {
+                if gate.load(Ordering::Acquire) {
+                    return Err(io::Error::other("fixture prevents running a real check"));
+                }
+                Ok(None)
+            }),
+        )
+        .unwrap();
+        let finished_ms = crate::unix_ms().unwrap();
+        let state = StudioState {
+            next_id: 4,
+            tasks: vec![crate::TaskRecord {
+                id: 1,
+                run_id: 2,
+                bot_id: 3,
+                prompt: "Completed edit".into(),
+                mode: AgentMode::EditWorktree,
+                status: TaskStatus::Succeeded,
+                created_ms: finished_ms,
+            }],
+            runs: vec![crate::RunRecord {
+                id: 2,
+                task_id: 1,
+                session_id: 3,
+                status: TaskStatus::Succeeded,
+                started_ms: finished_ms,
+                finished_ms: Some(finished_ms),
+                exit_code: Some(0),
+                run_dir: None,
+                worktree_dir: Some(worktree),
+                error: None,
+            }],
+            ..StudioState::default()
+        };
+        crate::persist(&root, &state).unwrap();
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let shutdown = dispatch(&studio, limits, &checks, Request::Shutdown);
+        release.store(true, Ordering::Release);
+        assert_eq!(shutdown.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(checks.snapshot().unwrap()[0].hook, HookPhase::PostEdit);
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            dispatch(&studio, limits, &checks, Request::Shutdown).unwrap(),
+            (Response::Ok, true)
+        ));
+        drop(checks);
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
