@@ -2,8 +2,9 @@
 
 **ローカルでもサーバーでも動く、軽量・拡張可能なOSSのSoftware Factory。**
 
-> **現在はpre-alpha（設計・立ち上げ段階）です。** Rust Workspace、単一コマンド実行ランナー、読み取り専用のCodex CLI Adapterの試験実装を含みます。
-> AIエージェントの管理実行、Bot UI、GUI、サーバー常駐機能はまだありません。
+> **現在はpre-alpha（ローカルStudio MVP）です。** Rust製の実行ランナーとCodex CLI Adapterに加え、
+> Bot/Task/Runを永続化する制御層とネイティブGUIを試験実装しました。
+> 常駐Daemon、遠隔Worker、無人コード編集、強制終了と完全復旧は未実装です。
 
 [English README](README.md) · [アーキテクチャ](docs/ARCHITECTURE.md) · [ロードマップ](docs/ROADMAP.md)
 
@@ -44,6 +45,23 @@ cargo run -p kojora-cli -- agent codex \
 ```
 
 このAdapterは非対話・読み取り専用モードのみです。親プロセスの環境変数をクリアし、認証プロファイルを同時利用しないための排他ロックを設定します。**OS全体のSandboxや安全な自律編集機能を提供するものではありません。** 実際のログイン済みCodexによる統合テストはまだ実施していません。詳しくは[Agent Adapterの説明](docs/AGENT_ADAPTER.md)を参照してください。
+
+## ネイティブGUI（Studio MVP）
+
+macOS / Linuxのデスクトップで、Botの作成、タスク送信、実行履歴、Codexからの返信、
+Run/Sessionの識別子、標準出力・エラーを確認できます。
+
+```sh
+cargo run --release -p kojora-desktop
+```
+
+GUIのフォームでBot名、作業ディレクトリ、認証済みCodexプロファイルの絶対パスを登録してください。
+画面表示は英語ですが、日本語のタスク文はOSにある日本語フォントを探して表示します。
+文字化けする場合は `KOJORA_GUI_FONT` に利用可能なCJKフォントの絶対パスを指定してください。現段階ではGUIプロセス内のバックグラウンドスレッドで実行する方式で、
+遠隔Daemonではありません。同時実行は1タスクです。Codexは原則読み取り専用ですが、
+明示的に確認した場合は分離したGit Worktree内で編集案を作成し、差分をGUIで確認できます。
+このモードでも自動コミット・Pushはしません。信頼できるGitリポジトリだけで利用してください。
+詳細は[Studio MVP](docs/STUDIO_MVP.md)をご覧ください。
 
 設計への参加は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
 ライセンスは[MIT](LICENSE)です。

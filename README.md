@@ -2,9 +2,9 @@
 
 **An open, lightweight, modular software factory for AI-powered development.**
 
-> **Status: pre-alpha / design and bootstrap stage.** The repository currently
-> contains an experimental Rust workspace and a single-command process runner. It does
-> **not** yet run managed coding agents, host bots, or provide a GUI.
+> **Status: pre-alpha / local Studio MVP.** The repository now contains a
+> native GUI, durable Bot/Task/Run records, and one-shot read-only Codex
+> execution. It is not yet an unattended autonomous coding platform.
 
 [日本語 README](README.ja.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
 
@@ -39,7 +39,9 @@ crates/
   kojora-core/      Experimental core types and scheduler policy
   kojora-runtime/   Experimental single-command process runner
   kojora-agents/    Provider-neutral adapter trait and Codex CLI bootstrap
-  kojora-cli/       Minimal command-line scaffold
+  kojora-cli/       Headless process/agent CLI
+  kojora-studio/    Durable Bot/Task/Run controller (no GUI deps)
+  kojora-desktop/   Native egui desktop application
 
 docs/
   ARCHITECTURE.md   Domain and component boundaries
@@ -61,6 +63,34 @@ cargo run -p kojora-cli -- run -- git --version
 ```
 
 `run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) and [Codex adapter](docs/AGENT_ADAPTER.md) for usage, privacy and limitations.
+
+## Native Studio MVP (experimental)
+
+The desktop is written in Rust and runs locally on macOS or Linux. It shows
+Bot conversations, Task/Run/Session IDs, run status, bounded output and a
+read-only Codex prompt composer. An optional explicitly confirmed edit mode
+runs Codex only in a detached Git worktree, with a bounded diff viewer.
+There is no automatic commit or push.
+
+Initialize a private Codex profile outside the project:
+
+```sh
+mkdir -p "$HOME/.config/kojora/profiles"
+mkdir -m 700 "$HOME/.config/kojora/profiles/codex-primary"
+CODEX_HOME="$HOME/.config/kojora/profiles/codex-primary" codex login
+```
+
+Launch the GUI:
+
+```sh
+cargo run --release -p kojora-desktop
+```
+
+Create a Bot with absolute workspace and profile paths. Metadata and logs
+are saved to a private local state directory. The GUI never waits on the
+rendering thread, and the headless CLI still works without compiling egui.
+
+Read [Studio MVP](docs/STUDIO_MVP.md) for security boundaries and limitations.
 
 ## Open design questions
 
