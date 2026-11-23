@@ -13,10 +13,13 @@ implementation details and layout can change substantially.
 ## Development checks
 
 ```sh
-cargo fmt --all -- --check
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
+./scripts/verify
 ```
+
+Install Python 3 and Rustup. CI runs the same verification command. It checks
+crate dependencies before running Rustfmt, tests and Clippy. See
+[the feature map](docs/ARCHITECTURE.md#local-mvp-feature-map) to find the
+entry point and regression coverage for each feature.
 
 CI uses the Rust version in `rust-toolchain.toml` and the committed
 `Cargo.lock`. Workspace lints reject panicking shortcuts in production code,

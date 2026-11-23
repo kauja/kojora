@@ -28,12 +28,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libxkbcommon-x11-0 libssl-dev xvfb xauth libgl1-mesa-dri
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Test
-        run: cargo test --locked --workspace
-      - name: Lint
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Verify architecture, format, behavior and lints
+        run: ./scripts/verify
       - name: Smoke-launch the native Studio under Xvfb
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"

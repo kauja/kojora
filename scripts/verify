@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+WORKSPACE_DEPENDENCIES = {
+    "kojora-core": set(),
+    "kojora-runtime": set(),
+    "kojora-agents": {"kojora-runtime"},
+    "kojora-cli": {"kojora-runtime", "kojora-agents"},
+    "kojora-studio": {"kojora-runtime", "kojora-agents"},
+    "kojora-worker": {"kojora-runtime", "kojora-studio"},
+    "kojora-desktop": {"kojora-studio"},
+}
+
+
+def architecture_violations(packages):
+    for package in packages:
+        name = package["name"]
+        if name not in WORKSPACE_DEPENDENCIES:
+            yield f"{name} needs a workspace dependency policy in scripts/verify"
+            continue
+        dependencies = {dependency["name"] for dependency in package["dependencies"]}
+        actual = dependencies & WORKSPACE_DEPENDENCIES.keys()
+        for dependency in sorted(actual - WORKSPACE_DEPENDENCIES[name]):
+            yield f"{name} may not depend on {dependency}"
+        if name != "kojora-desktop":
+            for dependency in sorted(dependencies & {"eframe", "egui", "winit"}):
+                yield f"{name} may not depend on the desktop library {dependency}"
+
+
+def main():
+    os.chdir(Path(__file__).resolve().parents[1])
+    try:
+        metadata = subprocess.check_output([
+            "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"
+        ])
+        errors = list(architecture_violations(json.loads(metadata)["packages"]))
+        if errors:
+            for error in errors:
+                print(error, file=sys.stderr)
+            return 1
+        for check in [
+            ["cargo", "fmt", "--all", "--", "--check"],
+            ["cargo", "test", "--locked", "--workspace"],
+            ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
+        ]:
+            print(" ".join(check), flush=True)
+            subprocess.run(check, check=True)
+    except subprocess.CalledProcessError as error:
+        return error.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

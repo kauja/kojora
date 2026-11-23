@@ -37,6 +37,31 @@ Bot channels (native GUI, CLI, future web/chat connectors)
 5. A crashed or upgraded worker must not silently orphan task ownership.
 6. Candidate Factory builds never overwrite the stable controlling runtime.
 
+## Local MVP feature map
+
+| Feature | How to reach it | Implementation and evidence |
+| --- | --- | --- |
+| Inspect with a chosen account | Create a Bot in Desktop or run `kojora agent` with `--profile` | `kojora-agents` owns the adapter contract and profile lease. The CLI integration test launches a fixture with two profiles and checks the selected account and cleared credentials. |
+| Start a task from Desktop | Create a Bot, write a prompt, and select Send task | `kojora-studio` owns task admission and durable Run state. The standalone Worker test submits tasks to two accounts over the private socket and checks their separate results after reconnecting. |
+| Review a Codex edit | Enable edits, confirm the task, then select Worktree diff in the Run inspector | Studio saves the worktree before launching the agent. A Git fixture checks the saved worktree, bounded diff and original checkout. |
+| Stop or inspect a running task | Use the task's Stop button and Run inspector | `kojora-runtime` records process outcomes. Cancellation and bounded log tests exercise the local process runner. |
+| Queue local checks | Enable check presets in Worker and open the edit Run inspector | The check queue and admission tests cover exclusive execution and post-edit deduplication. |
+
+## Dependency and verification rules
+
+The Desktop uses Studio for Bot and Task operations. The CLI and Studio use
+`AgentAdapter` to construct provider commands. The runtime owns provider
+process lifecycle and environment handling. Provider support, including optional edit
+capability, is checked before admitting a Task.
+
+Run `./scripts/verify` locally and in CI. The script rejects unapproved crate
+dependencies and records tests and strict lint results. Keep permission and
+resource constraints in executable code. Use one provider launch path for
+local and Worker modes. Remove obsolete implementations and add a regression
+to the user-facing entry point where a failure appeared. Rust unsafe blocks
+carry the safety rationale required by Clippy.
+[Lauren Tan on verification](https://www.youtube.com/watch?v=NjoZoUm85x0&t=510s) · [Lauren Tan on Dune](https://www.youtube.com/watch?v=NjoZoUm85x0&t=1514s)
+
 ## Plugin strategy (proposed)
 
 - **Built-ins:** fast, trusted in-process Rust implementations.

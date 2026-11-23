@@ -207,11 +207,6 @@ impl DesktopApp {
             });
 
         ui.separator();
-        ui.label(
-            egui::RichText::new("Read-only agent · 1 active run")
-                .small()
-                .weak(),
-        );
         if let Some(studio) = &self.studio {
             ui.label(
                 egui::RichText::new(studio.data_dir().to_string_lossy().to_string())
