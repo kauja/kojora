@@ -25,12 +25,20 @@ enum DiffPreview {
     Ready(Result<String, String>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InspectorOutput {
+    #[default]
+    Agent,
+    Check(u64),
+    Diff,
+}
+
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
-    selected_check: Option<u64>,
+    inspector_output: InspectorOutput,
     history_page: usize,
     adding_bot: bool,
     new_bot_name: String,
@@ -41,7 +49,6 @@ struct DesktopApp {
     notice: String,
     show_stderr: bool,
     show_raw_events: bool,
-    show_diff: bool,
     diff_preview: Option<(u64, DiffPreview)>,
     edit_mode: bool,
     confirm_edit: bool,
@@ -62,7 +69,7 @@ impl DesktopApp {
             error,
             selected_bot: None,
             selected_task: None,
-            selected_check: None,
+            inspector_output: InspectorOutput::default(),
             history_page: 0,
             adding_bot: false,
             new_bot_name: String::new(),
@@ -76,10 +83,18 @@ impl DesktopApp {
             notice: String::new(),
             show_stderr: false,
             show_raw_events: false,
-            show_diff: false,
             diff_preview: None,
             edit_mode: false,
             confirm_edit: false,
+        }
+    }
+
+    fn select_task(&mut self, task: Option<u64>) {
+        if self.selected_task != task {
+            self.selected_task = task;
+            self.inspector_output = InspectorOutput::Agent;
+            self.show_stderr = false;
+            self.show_raw_events = false;
         }
     }
 
@@ -95,7 +110,7 @@ impl DesktopApp {
         ) {
             Ok(id) => {
                 self.selected_bot = Some(id);
-                self.selected_task = None;
+                self.select_task(None);
                 self.history_page = 0;
                 self.adding_bot = false;
                 self.new_bot_name.clear();
@@ -122,12 +137,9 @@ impl DesktopApp {
         };
         match studio.submit_with_mode(bot_id, &self.prompt, mode) {
             Ok(task_id) => {
-                self.selected_task = Some(task_id);
+                self.select_task(Some(task_id));
                 self.notice = format!("Task #{task_id} started.");
                 self.prompt.clear();
-                self.show_stderr = false;
-                self.show_raw_events = false;
-                self.show_diff = false;
             }
             Err(error) => {
                 self.notice = format!("Could not launch agent: {error}");
@@ -163,10 +175,8 @@ impl DesktopApp {
                     let label = format!("◉  {}", bot.name);
                     if ui.selectable_label(selected, label).clicked() {
                         self.selected_bot = Some(bot.id);
-                        self.selected_task = None;
+                        self.select_task(None);
                         self.history_page = 0;
-                        self.show_stderr = false;
-                        self.show_raw_events = false;
                         self.edit_mode = false;
                     }
                     ui.label(
@@ -338,7 +348,7 @@ impl DesktopApp {
                                 .selectable_label(selected, format!("Task #{}", task.id))
                                 .clicked()
                             {
-                                self.selected_task = Some(task.id);
+                                self.select_task(Some(task.id));
                             }
                             status_label(ui, task.status);
                         });
@@ -398,7 +408,7 @@ impl DesktopApp {
             return;
         };
         let Some(task) = state.tasks.iter().find(|task| task.id == task_id) else {
-            self.selected_task = None;
+            self.select_task(None);
             return;
         };
         ui.strong(format!("Task #{}", task.id));
@@ -465,25 +475,18 @@ impl DesktopApp {
                     }
                     if let Ok(checks) = studio.checks() {
                         for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
-                            ui.horizontal(|ui| {
-                                let label =
-                                    format!("#{} {:?}: {:?}", check.id, check.kind, check.status);
-                                if ui.small_button(label).clicked() {
-                                    self.selected_check = Some(check.id);
-                                    self.show_diff = false;
-                                }
-                            });
+                            ui.selectable_value(
+                                &mut self.inspector_output,
+                                InspectorOutput::Check(check.id),
+                                format!("#{} {:?}: {:?}", check.id, check.kind, check.status),
+                            );
                         }
-                        if let Some(check_id) = self.selected_check {
-                            if checks
+                        if let InspectorOutput::Check(check_id) = self.inspector_output {
+                            if !checks
                                 .iter()
                                 .any(|r| r.id == check_id && r.task_id == task_id)
                             {
-                                if ui.small_button("Return to agent log").clicked() {
-                                    self.selected_check = None;
-                                }
-                            } else {
-                                self.selected_check = None;
+                                self.inspector_output = InspectorOutput::Agent;
                             }
                         }
                     }
@@ -501,18 +504,22 @@ impl DesktopApp {
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.show_stderr, false, "Stdout");
-            ui.selectable_value(&mut self.show_stderr, true, "Stderr");
+            ui.selectable_value(
+                &mut self.inspector_output,
+                InspectorOutput::Agent,
+                "Agent log",
+            );
+            if task.mode == AgentMode::EditWorktree {
+                ui.selectable_value(
+                    &mut self.inspector_output,
+                    InspectorOutput::Diff,
+                    "Worktree diff",
+                );
+            }
         });
-        ui.checkbox(&mut self.show_raw_events, "Raw JSONL");
-        if task.mode == AgentMode::EditWorktree {
-            ui.checkbox(&mut self.show_diff, "Worktree diff");
-        } else {
-            self.show_diff = false;
-        }
-        ui.separator();
 
-        if self.selected_check.is_none() && self.show_diff {
+        if self.inspector_output == InspectorOutput::Diff {
+            ui.separator();
             if task.status == TaskStatus::Running {
                 ui.label("The worktree diff is available after the task finishes.");
             } else {
@@ -521,15 +528,24 @@ impl DesktopApp {
             return;
         }
 
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_stderr, false, "Stdout");
+            ui.selectable_value(&mut self.show_stderr, true, "Stderr");
+            if self.inspector_output == InspectorOutput::Agent && !self.show_stderr {
+                ui.checkbox(&mut self.show_raw_events, "Raw JSONL");
+            }
+        });
+        ui.separator();
+
         if let Some(studio) = &self.studio {
-            let output_result = if let Some(check_id) = self.selected_check {
+            let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
                 studio.check_log(check_id, self.show_stderr)
             } else {
                 studio.read_log_tail(task_id, self.show_stderr)
             };
             match output_result {
                 Ok(raw) => {
-                    let output = if self.selected_check.is_none()
+                    let output = if self.inspector_output == InspectorOutput::Agent
                         && !self.show_stderr
                         && !self.show_raw_events
                     {
@@ -937,6 +953,24 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_tasks_resets_the_inspector_to_agent_stdout() {
+        let mut app = DesktopApp::new(LaunchTarget::Local(PathBuf::new()));
+        app.select_task(Some(1));
+        app.inspector_output = InspectorOutput::Check(7);
+        app.show_stderr = true;
+        app.show_raw_events = true;
+
+        app.select_task(Some(1));
+        assert_eq!(app.inspector_output, InspectorOutput::Check(7));
+
+        app.select_task(Some(2));
+        assert_eq!(app.selected_task, Some(2));
+        assert_eq!(app.inspector_output, InspectorOutput::Agent);
+        assert!(!app.show_stderr);
+        assert!(!app.show_raw_events);
+    }
 
     #[test]
     fn explicit_directory_and_socket_do_not_require_a_default() {
