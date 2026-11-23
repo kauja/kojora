@@ -10,7 +10,9 @@ read-only Codex run/view loop, not an unattended autonomous development system.
 2. Prepare a separate private authenticated Codex profile outside your project.
 3. Launch the desktop and create a Bot.
 4. Send a task; inspect output, run IDs, session IDs, task state and logs.
-5. Restart the app; historical tasks and log metadata remain visible.
+5. Use **Stop task** if the running Codex process needs to be cancelled.
+   Wait for the task state to become `Cancelled` before closing the GUI.
+6. Restart the app; historical tasks and log metadata remain visible.
 
 Initialize the profile using the official CLI:
 
@@ -66,9 +68,11 @@ controller. Default workspace builds exclude the GUI.
 
 ## Explicit limitations
 
-- This is not yet a remote worker or daemon; closing the GUI during a running
-  task can interrupt tracking and may leave the child process running.
-  Do not close Studio until the agent finishes.
+- Local mode still ties task tracking to the GUI process. Closing local-mode
+  Studio while a task is running can leave an orphan.
+- Worker-connected mode uses `kojora-worker` and `--worker-socket ABSOLUTE_PATH`.
+  Closing/reopening the GUI does **not** stop a Worker task. A Worker crash
+  can still leave an orphan. See [Worker Daemon](WORKER.md).
 - The startup recovery flag marks unfinished tasks `Interrupted`, but
   does not locate or kill orphan processes.
 - An optional **explicitly confirmed edit mode** can launch Codex
@@ -84,7 +88,21 @@ controller. Default workspace builds exclude the GUI.
 - **The provider's workspace-write sandbox is not a complete security
   boundary.** Git config, hooks/filters, provider tools and projects
   may execute unexpected code; do not run on untrusted checkouts.
-- There is no process cancellation, multi-agent scheduling, autonomous PR
+- **Stop task** requests cancellation of the exact active Task ID; the
+  request is asynchronous and does not freeze the GUI. On macOS/Linux, the
+  runtime starts Codex in a separate OS process group, sends SIGTERM, waits
+  briefly for cleanup, then sends SIGKILL to the group before reaping its
+  leader and draining output. This also covers normal child subprocesses
+  that share the agent process group. A successful cancellation is stored as
+  `Cancelled` (distinct from `Failed` and crash-recovery `Interrupted`).
+  The `events.jsonl` journal records `"cancelled": true` for a stopped
+  process. The same API works for read-only and opt-in worktree edit runs.
+- Cancellation is **not a secure sandbox or guaranteed full machine process
+  cleanup**: detached/daemonized descendants that created their own OS
+  process group may survive, and abruptly closing or killing Studio itself
+  still risks orphaned processes. The UI warns users not to close while
+  running. Windows process-tree termination is not implemented.
+- There is no multi-agent scheduling, automatic timeouts, autonomous PR
   creation, integrated terminal, or resource telemetry.
 - Every task creates one new Run/Session ID, but underlying Codex conversations
   are **not resumed** across prompts. Chat-like display is only a local

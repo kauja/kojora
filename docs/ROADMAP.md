@@ -14,15 +14,18 @@ Milestones are capability targets, not release-date promises.
 
 - [x] Bootstrap Codex CLI adapter (one-shot read-only, no live credential test)
 - [ ] Validate a real provider CLI end-to-end and define permissions beyond read-only
-- [ ] Own and track process lifecycles without relying on a GUI
+- [x] Local cancellable process execution with logged Unix process-group shutdown (experimental)
+- [ ] Crash-safe independent worker supervision and orphan reconciliation
 - [x] Local durable Bot/Task/Run/Session metadata and interrupted-run markers (experimental)
 - [ ] True resumable sessions and robust crash/process reconciliation
 - [ ] Isolate provider configuration/authentication profiles
-- [ ] Expose a versioned local control API and structured event stream
+- [x] Private versioned Unix-domain Worker control API (experimental)
+- [ ] Structured event subscription and remote control API
 
 ## M2 — Resource-aware orchestration
 
-- [ ] Host process-tree memory, CPU and pressure telemetry
+- [x] Per-process Unix CPU/virtual memory ceilings with single-task admission
+- [ ] Aggregate process-tree RSS/CPU telemetry and resource budgets
 - [ ] Admission control, budgets, queues and audit logs
 - [ ] Multiple agent sessions and Git worktree isolation
 - [ ] Safe pause/resume where agent adapters support it
@@ -33,7 +36,8 @@ Milestones are capability targets, not release-date promises.
 - [x] Native Rust Bot-first Studio GUI (local read-only Codex MVP)
 - [x] Task → Run → Session identifiers with bounded live stdout/stderr viewer
 - [x] Opt-in isolated Git worktree edit runs and bounded diff preview (experimental)
-- [ ] Integrated terminal, artifact browsing, process cancellation
+- [x] Native GUI stop action with Task-ID matching and persisted Cancelled status
+- [ ] Integrated terminal and artifact browsing
 - [ ] Remote Linux worker control from local macOS desktop
 - [ ] macOS GUI automation as a separately permissioned worker plugin
 

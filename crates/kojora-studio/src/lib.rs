@@ -1,15 +1,21 @@
 //! Headless local studio control plane: durable bot/task/run records.
 //! No UI framework is used here. Execution is single-flight on purpose.
 
+#[cfg(unix)]
+pub mod worker;
+
 use fs2::FileExt;
-use kojora_agents::{run_agent, AgentRequest, CodexExecAdapter, CodexWorkspaceWriteAdapter};
-use kojora_runtime::{LocalExecutor, RunOutcome};
+use kojora_agents::{
+    run_agent_cancellable, run_agent_cancellable_limited, AgentRequest, CodexExecAdapter,
+    CodexWorkspaceWriteAdapter,
+};
+use kojora_runtime::{CancellationToken, LocalExecutor, RunOutcome};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +74,7 @@ pub enum TaskStatus {
     Succeeded,
     Failed,
     Interrupted,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -77,6 +84,7 @@ impl TaskStatus {
             Self::Succeeded => "Succeeded",
             Self::Failed => "Failed",
             Self::Interrupted => "Interrupted",
+            Self::Cancelled => "Cancelled",
         }
     }
 }
@@ -118,13 +126,17 @@ pub struct RunRecord {
 }
 
 /// A runner can be replaced by a credential-free fake in automated tests.
-pub type AgentRunner =
-    dyn Fn(&BotRecord, &str, &Path, AgentMode) -> io::Result<RunOutcome> + Send + Sync + 'static;
+pub type AgentRunner = dyn Fn(&BotRecord, &str, &Path, AgentMode, &CancellationToken) -> io::Result<RunOutcome>
+    + Send
+    + Sync
+    + 'static;
 
 pub struct Studio {
     root: PathBuf,
     state: Arc<Mutex<StudioState>>,
     active: Arc<AtomicBool>,
+    active_task: Arc<AtomicU64>,
+    cancellation: CancellationToken,
     last_error: Arc<Mutex<Option<String>>>,
     runner: Arc<AgentRunner>,
     _instance_lock: Arc<File>,
@@ -134,7 +146,7 @@ impl Studio {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         Self::open_with_runner(
             root,
-            Arc::new(|bot, prompt, log_root, mode| {
+            Arc::new(|bot, prompt, log_root, mode, cancellation| {
                 let request = AgentRequest {
                     prompt,
                     workspace: &bot.workspace,
@@ -142,10 +154,55 @@ impl Studio {
                     log_root,
                 };
                 match mode {
-                    AgentMode::Inspect => run_agent(&CodexExecAdapter, &LocalExecutor, &request),
-                    AgentMode::EditWorktree => {
-                        run_agent(&CodexWorkspaceWriteAdapter, &LocalExecutor, &request)
-                    }
+                    AgentMode::Inspect => run_agent_cancellable(
+                        &CodexExecAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                    ),
+                    AgentMode::EditWorktree => run_agent_cancellable(
+                        &CodexWorkspaceWriteAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                    ),
+                }
+            }),
+        )
+    }
+
+    /// Opens the single-instance state store with per-child OS ceilings.
+    /// Worker Daemon calls this; Desktop can continue to use unrestricted
+    /// local mode. No GUI dependencies are imported by the service.
+    pub fn open_with_limits(
+        root: impl Into<PathBuf>,
+        limits: kojora_runtime::ProcessLimits,
+    ) -> io::Result<Self> {
+        limits.validate()?;
+        Self::open_with_runner(
+            root,
+            Arc::new(move |bot, prompt, log_root, mode, cancellation| {
+                let request = AgentRequest {
+                    prompt,
+                    workspace: &bot.workspace,
+                    profile_dir: &bot.profile_dir,
+                    log_root,
+                };
+                match mode {
+                    AgentMode::Inspect => run_agent_cancellable_limited(
+                        &CodexExecAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                        limits,
+                    ),
+                    AgentMode::EditWorktree => run_agent_cancellable_limited(
+                        &CodexWorkspaceWriteAdapter,
+                        &LocalExecutor,
+                        &request,
+                        cancellation,
+                        limits,
+                    ),
                 }
             }),
         )
@@ -193,6 +250,8 @@ impl Studio {
             root,
             state: Arc::new(Mutex::new(state)),
             active: Arc::new(AtomicBool::new(false)),
+            active_task: Arc::new(AtomicU64::new(0)),
+            cancellation: CancellationToken::default(),
             last_error: Arc::new(Mutex::new(None)),
             runner,
             _instance_lock: lock,
@@ -209,6 +268,29 @@ impl Studio {
 
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// Returns the one currently executing Task ID, if any.
+    pub fn active_task_id(&self) -> Option<u64> {
+        let id = self.active_task.load(Ordering::Acquire);
+        (id != 0 && self.is_active()).then_some(id)
+    }
+
+    pub fn cancellation_requested(&self, task_id: u64) -> bool {
+        self.active_task_id() == Some(task_id) && self.cancellation.is_cancelled()
+    }
+
+    /// Request cancellation of exactly the active task. This does not block
+    /// the GUI while the process group is being terminated and logs drained.
+    pub fn cancel_task(&self, task_id: u64) -> io::Result<()> {
+        if self.active_task_id() != Some(task_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "task is not the currently active run",
+            ));
+        }
+        self.cancellation.cancel();
+        Ok(())
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -266,6 +348,9 @@ impl Studio {
             ));
         }
 
+        // Only the sole active submitter may reset the shared token.
+        self.cancellation.reset();
+
         let prepared = (|| -> io::Result<(u64, u64, BotRecord)> {
             let mut state = self.state.lock().map_err(lock_error)?;
             let mut candidate = state.clone();
@@ -312,29 +397,55 @@ impl Studio {
             }
         };
 
+        self.active_task.store(task_id, Ordering::Release);
         let root = self.root.clone();
         let instance_lock = Arc::clone(&self._instance_lock);
         let shared_state = Arc::clone(&self.state);
         let active = Arc::clone(&self.active);
+        let active_task = Arc::clone(&self.active_task);
+        let cancellation = self.cancellation.clone();
         let last_error = Arc::clone(&self.last_error);
         let runner = Arc::clone(&self.runner);
         let prompt = prompt.to_owned();
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
-                let _instance_lock = instance_lock;
-                struct ActiveGuard(Arc<AtomicBool>);
+                struct ActiveGuard {
+                    active: Arc<AtomicBool>,
+                    active_task: Arc<AtomicU64>,
+                    cancellation: CancellationToken,
+                }
                 impl Drop for ActiveGuard {
                     fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
+                        self.active_task.store(0, Ordering::Release);
+                        self.cancellation.reset();
+                        self.active.store(false, Ordering::Release);
                     }
                 }
-                let _guard = ActiveGuard(active);
+                let _guard = ActiveGuard {
+                    active,
+                    active_task,
+                    cancellation: cancellation.clone(),
+                };
+                // Release the worker's lock before the guard publishes idle.
+                let _instance_lock = instance_lock;
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
-                let outcome = match mode {
-                    AgentMode::Inspect => runner(&bot, &prompt, &task_log_root, mode),
-                    AgentMode::EditWorktree => {
-                        create_detached_worktree(&root, &bot.workspace, task_id).and_then(|path| {
+                let outcome = if cancellation.is_cancelled() {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "task cancelled before launch",
+                    ))
+                } else {
+                    match mode {
+                        AgentMode::Inspect => {
+                            runner(&bot, &prompt, &task_log_root, mode, &cancellation)
+                        }
+                        AgentMode::EditWorktree => create_detached_worktree(
+                            &root,
+                            &bot.workspace,
+                            task_id,
+                        )
+                        .and_then(|path| {
                             {
                                 let mut state = shared_state.lock().map_err(lock_error)?;
                                 let mut candidate = state.clone();
@@ -348,10 +459,16 @@ impl Studio {
                                 run.worktree_dir = Some(path.clone());
                                 commit_state(&root, &mut state, candidate)?;
                             }
+                            if cancellation.is_cancelled() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "task cancelled before agent launch",
+                                ));
+                            }
                             let mut isolated_bot = bot;
                             isolated_bot.workspace = path;
-                            runner(&isolated_bot, &prompt, &task_log_root, mode)
-                        })
+                            runner(&isolated_bot, &prompt, &task_log_root, mode, &cancellation)
+                        }),
                     }
                 };
                 let mut state = match shared_state.lock() {
@@ -361,7 +478,9 @@ impl Studio {
 
                 let (status, exit_code, run_dir, error) = match outcome {
                     Ok(outcome) => (
-                        if outcome.success {
+                        if outcome.cancelled {
+                            TaskStatus::Cancelled
+                        } else if outcome.success {
                             TaskStatus::Succeeded
                         } else {
                             TaskStatus::Failed
@@ -370,7 +489,17 @@ impl Studio {
                         Some(outcome.run_dir),
                         None,
                     ),
-                    Err(error) => (TaskStatus::Failed, None, None, Some(error.to_string())),
+                    Err(error) => (
+                        if cancellation.is_cancelled() && error.kind() == io::ErrorKind::Interrupted
+                        {
+                            TaskStatus::Cancelled
+                        } else {
+                            TaskStatus::Failed
+                        },
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    ),
                 };
                 let mut candidate = state.clone();
                 if let Some(task) = candidate.tasks.iter_mut().find(|task| task.id == task_id) {
@@ -390,6 +519,8 @@ impl Studio {
                 }
             });
         if let Err(error) = spawn {
+            self.active_task.store(0, Ordering::Release);
+            self.cancellation.reset();
             self.active.store(false, Ordering::Release);
             let mut state = self.state.lock().map_err(lock_error)?;
             let mut candidate = state.clone();
@@ -768,7 +899,7 @@ mod tests {
     }
 
     fn fake_runner() -> Arc<AgentRunner> {
-        Arc::new(|_bot, prompt, log_root, _mode| {
+        Arc::new(|_bot, prompt, log_root, _mode, _cancellation| {
             let path = log_root.join("fake-run");
             fs::create_dir_all(&path)?;
             fs::write(path.join("stdout.log"), format!("received: {prompt}"))?;
@@ -776,6 +907,7 @@ mod tests {
                 run_dir: path,
                 exit_code: Some(0),
                 success: true,
+                cancelled: false,
                 duration: Duration::ZERO,
                 stdout_bytes: prompt.len() as u64,
                 stderr_bytes: 0,
@@ -908,27 +1040,29 @@ mod tests {
 
         let studio_root = root.join("state");
         let state_root = studio_root.clone();
-        let fake: Arc<AgentRunner> = Arc::new(move |bot, _prompt, log_root, mode| {
-            assert_eq!(mode, AgentMode::EditWorktree);
-            let persisted = read_state(&state_root)?;
-            assert_eq!(
-                persisted.runs[0].worktree_dir.as_ref(),
-                Some(&bot.workspace)
-            );
-            assert_eq!(persisted.runs[0].status, TaskStatus::Running);
-            fs::write(bot.workspace.join("file.txt"), "changed\n")?;
-            let logs = log_root.join("fake-run");
-            fs::create_dir_all(&logs)?;
-            fs::write(logs.join("stdout.log"), b"ok")?;
-            Ok(RunOutcome {
-                run_dir: logs,
-                exit_code: Some(0),
-                success: true,
-                duration: Duration::ZERO,
-                stdout_bytes: 2,
-                stderr_bytes: 0,
-            })
-        });
+        let fake: Arc<AgentRunner> =
+            Arc::new(move |bot, _prompt, log_root, mode, _cancellation| {
+                assert_eq!(mode, AgentMode::EditWorktree);
+                let persisted = read_state(&state_root)?;
+                assert_eq!(
+                    persisted.runs[0].worktree_dir.as_ref(),
+                    Some(&bot.workspace)
+                );
+                assert_eq!(persisted.runs[0].status, TaskStatus::Running);
+                fs::write(bot.workspace.join("file.txt"), "changed\n")?;
+                let logs = log_root.join("fake-run");
+                fs::create_dir_all(&logs)?;
+                fs::write(logs.join("stdout.log"), b"ok")?;
+                Ok(RunOutcome {
+                    run_dir: logs,
+                    exit_code: Some(0),
+                    success: true,
+                    cancelled: false,
+                    duration: Duration::ZERO,
+                    stdout_bytes: 2,
+                    stderr_bytes: 0,
+                })
+            });
         let studio = Studio::open_with_runner(&studio_root, fake).unwrap();
         let id = studio
             .add_bot("Editor", project.clone(), root.join("profile"))
@@ -981,6 +1115,72 @@ mod tests {
         assert!(commit_state(&root, &mut shared, candidate).is_err());
         assert!(shared.bots.is_empty());
         assert_eq!(shared.next_id, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_rejects_wrong_task_and_persists_cancelled_status() {
+        let root = temporary_root("cancel");
+        let fake: Arc<AgentRunner> = Arc::new(|_bot, _prompt, log_root, _mode, token| {
+            for _ in 0..200 {
+                if token.is_cancelled() {
+                    let path = log_root.join("fake-run");
+                    fs::create_dir_all(&path)?;
+                    fs::write(path.join("stdout.log"), b"cancelled")?;
+                    return Ok(RunOutcome {
+                        run_dir: path,
+                        exit_code: None,
+                        success: false,
+                        cancelled: true,
+                        duration: Duration::ZERO,
+                        stdout_bytes: 9,
+                        stderr_bytes: 0,
+                    });
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cancel not received",
+            ))
+        });
+        let studio = Studio::open_with_runner(&root, fake).unwrap();
+        let bot_id = studio
+            .add_bot(
+                "Cancelled bot",
+                root.join("workspace"),
+                root.join("profile"),
+            )
+            .unwrap();
+        let task_id = studio.submit(bot_id, "stop me").unwrap();
+        assert_eq!(studio.active_task_id(), Some(task_id));
+        assert!(studio.cancel_task(task_id + 1).is_err());
+        assert!(!studio.cancellation_requested(task_id));
+        studio.cancel_task(task_id).unwrap();
+        assert!(studio.cancellation_requested(task_id));
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+        assert!(studio.cancel_task(task_id).is_err());
+        assert_eq!(
+            studio.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            studio.snapshot().unwrap().runs[0].status,
+            TaskStatus::Cancelled
+        );
+        drop(studio);
+        let reopened = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        assert_eq!(
+            reopened.snapshot().unwrap().tasks[0].status,
+            TaskStatus::Cancelled
+        );
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -3,7 +3,7 @@
 //! This bootstrap adapter is NOT a persistent session manager or a sandbox.
 //! Its public Rust traits are still experimental (not the future plugin ABI).
 
-use kojora_runtime::{IsolatedExecutor, RunOutcome, RunSpec};
+use kojora_runtime::{CancellationToken, IsolatedExecutor, ProcessLimits, RunOutcome, RunSpec};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -134,10 +134,51 @@ pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
     executor: &E,
     request: &AgentRequest<'_>,
 ) -> io::Result<RunOutcome> {
+    run_agent_inner(adapter, executor, request, None, None)
+}
+
+/// A cancellation-aware agent run. The profile lease remains held until
+/// the subprocess has exited and all output has been drained.
+pub fn run_agent_cancellable<A: AgentAdapter, E: IsolatedExecutor>(
+    adapter: &A,
+    executor: &E,
+    request: &AgentRequest<'_>,
+    token: &CancellationToken,
+) -> io::Result<RunOutcome> {
+    run_agent_inner(adapter, executor, request, Some(token), None)
+}
+
+/// Worker-enforced CPU and virtual address space limits. Never silently
+/// downgrade to an executor without resource-limit support.
+pub fn run_agent_cancellable_limited<A: AgentAdapter, E: IsolatedExecutor>(
+    adapter: &A,
+    executor: &E,
+    request: &AgentRequest<'_>,
+    token: &CancellationToken,
+    limits: ProcessLimits,
+) -> io::Result<RunOutcome> {
+    limits.validate()?;
+    run_agent_inner(adapter, executor, request, Some(token), Some(limits))
+}
+
+fn run_agent_inner<A: AgentAdapter, E: IsolatedExecutor>(
+    adapter: &A,
+    executor: &E,
+    request: &AgentRequest<'_>,
+    cancellation: Option<&CancellationToken>,
+    limits: Option<ProcessLimits>,
+) -> io::Result<RunOutcome> {
     if request.prompt.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "agent prompt must not be blank",
+        ));
+    }
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "task cancelled before launch",
         ));
     }
 
@@ -186,7 +227,21 @@ pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
         log_root: request.log_root.to_owned(),
     };
 
-    executor.run_isolated(&spec, &child_environment)
+    if let Some(token) = cancellation {
+        if token.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "task cancelled before launch",
+            ));
+        }
+        if let Some(limits) = limits {
+            executor.run_isolated_limited(&spec, &child_environment, token, limits)
+        } else {
+            executor.run_isolated_cancellable(&spec, &child_environment, token)
+        }
+    } else {
+        executor.run_isolated(&spec, &child_environment)
+    }
 }
 
 fn verify_private_profile(path: &Path) -> io::Result<PathBuf> {
@@ -273,6 +328,7 @@ mod tests {
                 run_dir: spec.log_root.join("fake"),
                 exit_code: Some(7),
                 success: false,
+                cancelled: false,
                 duration: Duration::ZERO,
                 stdout_bytes: 0,
                 stderr_bytes: 0,
@@ -369,6 +425,54 @@ mod tests {
             || name == "ANTHROPIC_API_KEY"));
         assert!(!profile.join(".kojora-agent.lock").exists());
         drop(call);
+        fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn cancellation_fails_closed_with_an_executor_that_cannot_stop() {
+        let profile = test_profile("cancellable");
+        let workspace = env::current_dir().unwrap();
+        let executor = RecordingExecutor::default();
+        let token = CancellationToken::default();
+        let result = run_agent_cancellable(
+            &CodexExecAdapter,
+            &executor,
+            &AgentRequest {
+                prompt: "Inspect source files",
+                workspace: &workspace,
+                profile_dir: &profile,
+                log_root: &workspace.join(".kojora").join("runs"),
+            },
+            &token,
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!profile.join(".kojora-agent.lock").exists());
+        fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn resource_limits_fail_closed_for_unsupported_executor() {
+        let profile = test_profile("limited");
+        let workspace = env::current_dir().unwrap();
+        let token = CancellationToken::default();
+        let error = run_agent_cancellable_limited(
+            &CodexExecAdapter,
+            &RecordingExecutor::default(),
+            &AgentRequest {
+                prompt: "Inspect repository",
+                workspace: &workspace,
+                profile_dir: &profile,
+                log_root: &workspace.join(".kojora").join("runs"),
+            },
+            &token,
+            ProcessLimits {
+                address_space_mib: Some(2048),
+                cpu_seconds: Some(100),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(!profile.join(".kojora-agent.lock").exists());
         fs::remove_dir_all(profile).unwrap();
     }
 

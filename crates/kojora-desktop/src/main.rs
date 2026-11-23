@@ -3,7 +3,8 @@
 
 use eframe::egui;
 use kojora_studio::{
-    default_data_dir, extract_agent_text, AgentMode, Studio, StudioState, TaskRecord, TaskStatus,
+    default_data_dir, extract_agent_text, worker::StudioConnection, AgentMode, StudioState,
+    TaskRecord, TaskStatus,
 };
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -20,7 +21,7 @@ enum DiffPreview {
 }
 
 struct DesktopApp {
-    studio: Option<Arc<Studio>>,
+    studio: Option<Arc<StudioConnection>>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
@@ -40,11 +41,15 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, socket: Option<PathBuf>) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        let (studio, error) = match Studio::open(root) {
+        let result = match socket {
+            Some(socket) => StudioConnection::connect_worker(socket),
+            None => StudioConnection::open_local(root),
+        };
+        let (studio, error) = match result {
             Ok(studio) => (Some(Arc::new(studio)), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -215,10 +220,24 @@ impl DesktopApp {
                 .map_or("Select a Bot", |bot| bot.name.as_str());
             ui.label(label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let active = self.studio.as_deref().is_some_and(Studio::is_active);
-                if active {
-                    ui.spinner();
-                    ui.colored_label(COLOR_ACCENT, "Agent running");
+                let active_task = self
+                    .studio
+                    .as_deref()
+                    .and_then(StudioConnection::active_task_id);
+                if let (Some(studio), Some(task_id)) = (&self.studio, active_task) {
+                    if studio.cancellation_requested(task_id) {
+                        ui.spinner();
+                        ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}..."));
+                    } else {
+                        if ui.button(format!("Stop task #{task_id}")).clicked() {
+                            self.notice = match studio.cancel_task(task_id) {
+                                Ok(()) => format!("Cancellation requested for task #{task_id}."),
+                                Err(error) => format!("Could not stop task: {error}"),
+                            };
+                        }
+                        ui.spinner();
+                        ui.colored_label(COLOR_ACCENT, "Agent running");
+                    }
                 } else {
                     ui.colored_label(COLOR_SUCCESS, "Ready");
                 }
@@ -330,7 +349,15 @@ impl DesktopApp {
                         } else if task.status == TaskStatus::Running {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Codex is processing this task...");
+                                let stopping = self
+                                    .studio
+                                    .as_ref()
+                                    .is_some_and(|studio| studio.cancellation_requested(task.id));
+                                ui.label(if stopping {
+                                    "Stopping Codex and collecting logs..."
+                                } else {
+                                    "Codex is processing this task..."
+                                });
                             });
                         } else {
                             ui.label(
@@ -530,7 +557,10 @@ impl DesktopApp {
     }
 
     fn composer(&mut self, ui: &mut egui::Ui) {
-        let active = self.studio.as_deref().is_some_and(Studio::is_active);
+        let active = self
+            .studio
+            .as_deref()
+            .is_some_and(|studio| studio.is_active());
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, "Codex");
             ui.label(
@@ -588,7 +618,11 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(
-            if self.studio.as_deref().is_some_and(Studio::is_active) {
+            if self
+                .studio
+                .as_deref()
+                .is_some_and(|studio| studio.is_active())
+            {
                 350
             } else {
                 1500
@@ -719,28 +753,48 @@ fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
     let color = match status {
         TaskStatus::Succeeded => COLOR_SUCCESS,
         TaskStatus::Running => COLOR_ACCENT,
+        TaskStatus::Cancelled => egui::Color32::GRAY,
         TaskStatus::Failed | TaskStatus::Interrupted => COLOR_ERROR,
     };
     ui.colored_label(color, status.label());
 }
 
 fn main() -> eframe::Result<()> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let data_dir = match args.as_slice() {
-        [_] => default_data_dir(),
-        [_, flag, path] if flag == "--data-dir" => Ok(PathBuf::from(path)),
-        _ => {
-            eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR]");
-            return Ok(());
-        }
-    };
-    let data_dir = match data_dir {
+    let mut data_dir = match default_data_dir() {
         Ok(dir) => dir,
         Err(error) => {
             eprintln!("Could not determine studio data directory: {error}");
             return Ok(());
         }
     };
+    let mut worker_socket = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--data-dir" => match args.next() {
+                Some(path) => data_dir = PathBuf::from(path),
+                None => {
+                    eprintln!("--data-dir requires an absolute directory");
+                    return Ok(());
+                }
+            },
+            "--worker-socket" => match args.next() {
+                Some(path) => worker_socket = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("--worker-socket requires an absolute socket path");
+                    return Ok(());
+                }
+            },
+            _ => {
+                eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]");
+                return Ok(());
+            }
+        }
+    }
+    if !data_dir.is_absolute() || worker_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
+        eprintln!("Data directory and worker socket paths must be absolute");
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1250.0, 800.0])
@@ -753,7 +807,10 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_cjk_fallback(&cc.egui_ctx);
-            Ok(Box::new(DesktopApp::new(data_dir.clone())))
+            Ok(Box::new(DesktopApp::new(
+                data_dir.clone(),
+                worker_socket.clone(),
+            )))
         }),
     )
 }

@@ -4,7 +4,7 @@
 
 > **現在はpre-alpha（ローカルStudio MVP）です。** Rust製の実行ランナーとCodex CLI Adapterに加え、
 > Bot/Task/Runを永続化する制御層とネイティブGUIを試験実装しました。
-> 常駐Daemon、遠隔Worker、無人コード編集、強制終了と完全復旧は未実装です。
+> 常駐Daemon、遠隔Worker、無人PR作成、異常終了時の孤児プロセス自動回収は未実装です。
 
 [English README](README.md) · [アーキテクチャ](docs/ARCHITECTURE.md) · [ロードマップ](docs/ROADMAP.md)
 
@@ -61,7 +61,29 @@ GUIのフォームでBot名、作業ディレクトリ、認証済みCodexプロ
 遠隔Daemonではありません。同時実行は1タスクです。Codexは原則読み取り専用ですが、
 明示的に確認した場合は分離したGit Worktree内で編集案を作成し、差分をGUIで確認できます。
 このモードでも自動コミット・Pushはしません。信頼できるGitリポジトリだけで利用してください。
+実行中には **Stop task** ボタンから明示的に停止を要求でき、macOS/Linuxでは
+Codexのプロセスグループを停止し、終了状態を `Cancelled` として履歴に保存します。
+GUI自体が強制終了した際のプロセス自動回収は引き続き未実装です。
 詳細は[Studio MVP](docs/STUDIO_MVP.md)をご覧ください。
+
+## ローカルWorker Daemon（試験実装）
+
+GUIとは別に `kojora-worker` を起動すると、GUIを閉じてもタスク管理が続きます。
+通信はユーザー専用のUnixソケットに限定し、資格情報はGUIへ渡しません。
+
+```sh
+mkdir -p "$HOME/.local/state/kojora" && chmod 700 "$HOME/.local/state/kojora"
+# ターミナル1：Workerを起動
+cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --cpu-seconds 900 --address-space-mib 8192
+# ターミナル2：GUIから接続
+cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/kojora/worker.sock"
+```
+
+**注意：** `RLIMIT_AS` は実メモリRSSではなく仮想アドレス空間の上限、
+`RLIMIT_CPU` は壁時計時間ではなく各プロセスのCPU消費秒数です。
+合算したリソース使用量や並列処理を制御するものではなく、同時実行はまだ1件です。
+Worker自体のクラッシュ復旧・孤児プロセス回収は未実装です。
+詳しくは[Worker Daemonガイド](docs/WORKER.md)をご覧ください。
 
 設計への参加は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
 ライセンスは[MIT](LICENSE)です。
