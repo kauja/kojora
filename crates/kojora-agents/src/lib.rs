@@ -4,6 +4,8 @@
 //! Its public Rust traits are still experimental (not the future plugin ABI).
 
 use kojora_runtime::{CancellationToken, IsolatedExecutor, ProcessLimits, RunOutcome, RunSpec};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -28,6 +30,64 @@ pub trait AgentAdapter {
     fn arguments(&self, prompt: &str) -> Vec<OsString>;
     fn profile_variable(&self) -> &'static str;
     fn capabilities(&self) -> AgentCapabilities;
+    fn response_text(&self, _event: &Value) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProvider {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
+impl AgentProvider {
+    pub const ALL: [Self; 2] = [Self::Codex, Self::ClaudeCode];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
+
+    pub fn inspect_adapter(self) -> &'static dyn AgentAdapter {
+        match self {
+            Self::Codex => &CodexExecAdapter,
+            Self::ClaudeCode => &ClaudeCodeAdapter,
+        }
+    }
+
+    pub fn edit_adapter(self) -> Option<&'static dyn AgentAdapter> {
+        match self {
+            Self::Codex => Some(&CodexWorkspaceWriteAdapter),
+            Self::ClaudeCode => None,
+        }
+    }
+
+    /// Parse complete JSON events from a bounded log tail.
+    pub fn extract_text(self, log: &str) -> String {
+        let adapter = self.inspect_adapter();
+        log.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|event| adapter.response_text(&event))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+impl std::str::FromStr for AgentProvider {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude-code" => Ok(Self::ClaudeCode),
+            _ => Err("expected provider 'codex' or 'claude-code'"),
+        }
+    }
 }
 
 /// One-shot Codex CLI agent in explicitly read-only mode.
@@ -68,6 +128,16 @@ impl AgentAdapter for CodexExecAdapter {
             resumable: false,
             read_only: true,
         }
+    }
+
+    fn response_text(&self, event: &Value) -> Option<String> {
+        let item = event.get("item")?;
+        if event.get("type")?.as_str()? != "item.completed"
+            || item.get("type")?.as_str()? != "agent_message"
+        {
+            return None;
+        }
+        item.get("text")?.as_str().map(str::to_owned)
     }
 }
 
@@ -119,6 +189,77 @@ impl AgentAdapter for CodexWorkspaceWriteAdapter {
     }
 }
 
+/// Claude Code 2.1.248 or later in restricted, inspection-only print mode.
+#[derive(Debug, Default)]
+pub struct ClaudeCodeAdapter;
+
+impl AgentAdapter for ClaudeCodeAdapter {
+    fn provider(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn executable(&self) -> OsString {
+        OsString::from("claude")
+    }
+
+    fn arguments(&self, prompt: &str) -> Vec<OsString> {
+        [
+            "--print",
+            "--restricted",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            "Read,Glob,Grep",
+            "--allowedTools",
+            "Read,Glob,Grep",
+            "--disallowedTools",
+            "mcp__*",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--settings",
+            r#"{"disableAllHooks":true,"autoMemoryEnabled":false}"#,
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--no-session-persistence",
+            "--",
+            prompt,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    fn profile_variable(&self) -> &'static str {
+        "CLAUDE_CONFIG_DIR"
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            jsonl_events: true,
+            resumable: false,
+            read_only: true,
+        }
+    }
+
+    fn response_text(&self, event: &Value) -> Option<String> {
+        if event.get("type")?.as_str()? != "assistant" {
+            return None;
+        }
+        let content = event.get("message")?.get("content")?.as_array()?;
+        let text = content
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text")?.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+}
+
 /// A single launch. Authentication already lives in profile_dir, not in Kojora.
 pub struct AgentRequest<'a> {
     pub prompt: &'a str,
@@ -129,7 +270,7 @@ pub struct AgentRequest<'a> {
 
 /// Runs an adapter with an environment cleared by the trusted executor.
 /// One profile may be used by only one local Kojora run at a time.
-pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
+pub fn run_agent<A: AgentAdapter + ?Sized, E: IsolatedExecutor>(
     adapter: &A,
     executor: &E,
     request: &AgentRequest<'_>,
@@ -139,7 +280,7 @@ pub fn run_agent<A: AgentAdapter, E: IsolatedExecutor>(
 
 /// A cancellation-aware agent run. The profile lease remains held until
 /// the subprocess has exited and all output has been drained.
-pub fn run_agent_cancellable<A: AgentAdapter, E: IsolatedExecutor>(
+pub fn run_agent_cancellable<A: AgentAdapter + ?Sized, E: IsolatedExecutor>(
     adapter: &A,
     executor: &E,
     request: &AgentRequest<'_>,
@@ -150,7 +291,7 @@ pub fn run_agent_cancellable<A: AgentAdapter, E: IsolatedExecutor>(
 
 /// Worker-enforced CPU and virtual address space limits. Never silently
 /// downgrade to an executor without resource-limit support.
-pub fn run_agent_cancellable_limited<A: AgentAdapter, E: IsolatedExecutor>(
+pub fn run_agent_cancellable_limited<A: AgentAdapter + ?Sized, E: IsolatedExecutor>(
     adapter: &A,
     executor: &E,
     request: &AgentRequest<'_>,
@@ -161,7 +302,7 @@ pub fn run_agent_cancellable_limited<A: AgentAdapter, E: IsolatedExecutor>(
     run_agent_inner(adapter, executor, request, Some(token), Some(limits))
 }
 
-fn run_agent_inner<A: AgentAdapter, E: IsolatedExecutor>(
+fn run_agent_inner<A: AgentAdapter + ?Sized, E: IsolatedExecutor>(
     adapter: &A,
     executor: &E,
     request: &AgentRequest<'_>,
@@ -292,6 +433,12 @@ impl Drop for ProfileLease {
 }
 
 #[cfg(all(test, unix))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

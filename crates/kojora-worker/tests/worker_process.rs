@@ -1,4 +1,10 @@
 #![cfg(unix)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 
 //! Exercise the real standalone daemon, not merely an in-process IPC server.
 use kojora_studio::worker::WorkerClient;

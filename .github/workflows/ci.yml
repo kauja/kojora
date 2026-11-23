@@ -1,5 +1,8 @@
 name: Rust CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -12,9 +15,12 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: 1.100.0
           components: rustfmt, clippy
       - name: Install native GUI build dependencies
         run: |
@@ -25,14 +31,14 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Smoke-launch the native Studio under Xvfb
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
-          cargo build -p kojora-desktop
+          cargo build --locked -p kojora-desktop
           test_dir="$(mktemp -d)"
           chmod 700 "$test_dir"
           set +e
@@ -54,7 +60,11 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: 1.100.0
       - name: Check native desktop on macOS
-        run: cargo check -p kojora-desktop --all-targets
+        run: cargo check --locked -p kojora-desktop --all-targets

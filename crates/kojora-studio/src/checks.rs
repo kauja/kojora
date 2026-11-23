@@ -250,10 +250,11 @@ impl CheckQueue {
                 "checks directory must be a real private directory",
             ));
         }
+        // SAFETY: geteuid reads the effective user ID without dereferencing pointers.
         #[cfg(unix)]
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        let owner = unsafe { libc::geteuid() };
+        #[cfg(unix)]
+        if metadata.uid() != owner || metadata.permissions().mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "checks directory must belong to the current user (mode 0700)",
@@ -269,9 +270,7 @@ impl CheckQueue {
                     ));
                 }
                 #[cfg(unix)]
-                if metadata.uid() != unsafe { libc::geteuid() }
-                    || metadata.permissions().mode() & 0o077 != 0
-                {
+                if metadata.uid() != owner || metadata.permissions().mode() & 0o077 != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "checks journal must belong to the current user (mode 0600)",
@@ -706,6 +705,12 @@ fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

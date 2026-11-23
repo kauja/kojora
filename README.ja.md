@@ -2,9 +2,9 @@
 
 **ローカルでもサーバーでも動く、軽量・拡張可能なOSSのSoftware Factory。**
 
-> **現在はpre-alpha（ローカルStudio MVP）です。** Rust製の実行ランナーとCodex CLI Adapterに加え、
+> **現在はpre-alpha（ローカルStudio MVP）です。** Rust製の実行ランナーとCodex・Claude Codeアダプターに加え、
 > Bot/Task/Runを永続化する制御層とネイティブGUIを試験実装しました。
-> 常駐Daemon、遠隔Worker、無人PR作成、異常終了時の孤児プロセス自動回収は未実装です。
+> 常駐WorkerはGUIから独立してローカルでタスクを管理します。
 
 [English README](README.md) · [アーキテクチャ](docs/ARCHITECTURE.md) · [ロードマップ](docs/ROADMAP.md)
 
@@ -19,7 +19,7 @@
 
 ## 初期段階の利用
 
-安定版Rustをインストールした環境で以下を実行してください。
+Rustupは `rust-toolchain.toml` に固定したRustを選びます。
 
 ```sh
 cargo test --workspace
@@ -30,7 +30,7 @@ cargo run -p kojora-cli -- run -- git --version
 
 `run` はユーザーが指定した信頼済みコマンドを直接実行し、終了状態と標準出力・標準エラーを `.kojora/runs/` 以下に保存します。**サンドボックス・常駐Daemon・AIエージェント管理機能ではありません。** 子プロセスは呼び出し元の権限と環境変数を継承します。ログに秘密情報が混入する可能性があるため、信頼できるコマンドのみを実行してください。詳細は[Runnerの説明](docs/RUNNER.md)を参照してください。
 
-## 試験的なCodex CLI Adapter
+## Codex・Claude Codeのアカウント設定
 
 専用の認証プロファイルを手動で初期化した環境で、次のように実行できます。
 
@@ -44,25 +44,36 @@ cargo run -p kojora-cli -- agent codex \
   -- "このRustプロジェクトの構成を説明して"
 ```
 
-このAdapterは非対話・読み取り専用モードのみです。親プロセスの環境変数をクリアし、認証プロファイルを同時利用しないための排他ロックを設定します。**OS全体のSandboxや安全な自律編集機能を提供するものではありません。** 実際のログイン済みCodexによる統合テストはまだ実施していません。詳しくは[Agent Adapterの説明](docs/AGENT_ADAPTER.md)を参照してください。
+Claude Code 2.1.248以降で個人用と仕事用のアカウントを使う例です。
+
+```bash
+profiles="$HOME/.config/kojora/profiles"
+mkdir -m 700 "$profiles/claude-personal" "$profiles/claude-work"
+CLAUDE_CONFIG_DIR="$profiles/claude-personal" claude auth login
+CLAUDE_CONFIG_DIR="$profiles/claude-work" claude auth login
+cargo run --locked -p kojora-cli -- agent claude-code \
+  --profile "$profiles/claude-work" -- "このプロジェクトの構成を説明して"
+```
+
+Kojoraはプロファイルを排他利用し、親プロセスのトークンをエージェントに渡しません。Claude Codeでは制限モードでファイルを参照できます。アカウントごとの認証状態はプロバイダーのCLIで確認してください。[アダプターの詳細](docs/AGENT_ADAPTER.md)
 
 ## ネイティブGUI（Studio MVP）
 
-macOS / Linuxのデスクトップで、Botの作成、タスク送信、実行履歴、Codexからの返信、
+macOS / Linuxのデスクトップで、Botの作成、タスク送信、実行履歴、エージェントからの返信、
 Run/Sessionの識別子、標準出力・エラーを確認できます。
 
 ```sh
 cargo run --release -p kojora-desktop
 ```
 
-GUIのフォームでBot名、作業ディレクトリ、認証済みCodexプロファイルの絶対パスを登録してください。
+GUIのフォームでBot名、作業ディレクトリ、プロバイダー、認証済みアカウントのプロファイルの絶対パスを登録します。Claude Codeの複数アカウントは、アカウントごとにBotを作成して切り替えます。
 画面表示は英語ですが、日本語のタスク文はOSにある日本語フォントを探して表示します。
 文字化けする場合は `KOJORA_GUI_FONT` に利用可能なCJKフォントの絶対パスを指定してください。現段階ではGUIプロセス内のバックグラウンドスレッドで実行する方式で、
 遠隔Daemonではありません。同時実行は1タスクです。Codexは原則読み取り専用ですが、
 明示的に確認した場合は分離したGit Worktree内で編集案を作成し、差分をGUIで確認できます。
 このモードでも自動コミット・Pushはしません。信頼できるGitリポジトリだけで利用してください。
 実行中には **Stop task** ボタンから明示的に停止を要求でき、macOS/Linuxでは
-Codexのプロセスグループを停止し、終了状態を `Cancelled` として履歴に保存します。
+エージェントのプロセスグループを停止し、終了状態を `Cancelled` として履歴に保存します。
 GUI自体が強制終了した際のプロセス自動回収は引き続き未実装です。
 詳細は[Studio MVP](docs/STUDIO_MVP.md)をご覧ください。
 

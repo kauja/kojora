@@ -14,9 +14,18 @@ implementation details and layout can change substantially.
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
+
+CI uses the Rust version in `rust-toolchain.toml` and the committed
+`Cargo.lock`. Workspace lints reject panicking shortcuts in production code,
+unfinished implementations, debugging macros and undocumented unsafe blocks.
+A test fixture may use assertions or unwrap a result to fail immediately.
+
+Use a credential-free runner or fixture to exercise a provider change.
+Record the exact commit and checks you ran. Document any credentialed smoke
+test that still needs to be run on the target machine.
 
 Before implementing a large feature, please open an issue or discussion
 covering requirements, alternatives and measurable acceptance criteria.

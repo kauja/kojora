@@ -159,6 +159,12 @@ impl Scheduler {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     #[test]

@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use crate::checks::{CheckKind, CheckPolicy, CheckQueue, CheckRecord, HookPhase};
-use crate::{AgentMode, Studio, StudioState, TaskStatus};
+use crate::{AgentMode, AgentProvider, Studio, StudioState, TaskStatus};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024 + 4096;
 
@@ -58,6 +58,7 @@ enum Request {
         name: String,
         workspace: PathBuf,
         profile_dir: PathBuf,
+        provider: AgentProvider,
     },
     Submit {
         bot_id: u64,
@@ -95,6 +96,7 @@ fn kind_name(kind: io::ErrorKind) -> &'static str {
         io::ErrorKind::WouldBlock => "busy",
         io::ErrorKind::InvalidInput => "invalid_input",
         io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::Unsupported => "unsupported",
         _ => "other",
     }
 }
@@ -105,6 +107,7 @@ fn decode_error(kind: &str, message: String) -> io::Error {
         "busy" => io::ErrorKind::WouldBlock,
         "invalid_input" => io::ErrorKind::InvalidInput,
         "permission_denied" => io::ErrorKind::PermissionDenied,
+        "unsupported" => io::ErrorKind::Unsupported,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, message)
@@ -210,8 +213,9 @@ fn dispatch(
             name,
             workspace,
             profile_dir,
+            provider,
         } => (
-            Response::Id(studio.add_bot(&name, workspace, profile_dir)?),
+            Response::Id(studio.add_bot_with_provider(&name, workspace, profile_dir, provider)?),
             false,
         ),
         Request::Submit {
@@ -489,10 +493,21 @@ impl WorkerClient {
     }
 
     pub fn add_bot(&self, name: &str, workspace: PathBuf, profile_dir: PathBuf) -> io::Result<u64> {
+        self.add_bot_with_provider(name, workspace, profile_dir, AgentProvider::default())
+    }
+
+    pub fn add_bot_with_provider(
+        &self,
+        name: &str,
+        workspace: PathBuf,
+        profile_dir: PathBuf,
+        provider: AgentProvider,
+    ) -> io::Result<u64> {
         match self.request(Request::AddBot {
             name: name.to_owned(),
             workspace,
             profile_dir,
+            provider,
         })? {
             Response::Id(value) => Ok(value),
             _ => Err(io::Error::new(
@@ -618,9 +633,23 @@ impl StudioConnection {
     }
 
     pub fn add_bot(&self, name: &str, workspace: PathBuf, profile_dir: PathBuf) -> io::Result<u64> {
+        self.add_bot_with_provider(name, workspace, profile_dir, AgentProvider::default())
+    }
+
+    pub fn add_bot_with_provider(
+        &self,
+        name: &str,
+        workspace: PathBuf,
+        profile_dir: PathBuf,
+        provider: AgentProvider,
+    ) -> io::Result<u64> {
         match self {
-            Self::Local(value) => value.add_bot(name, workspace, profile_dir),
-            Self::Worker(value) => value.add_bot(name, workspace, profile_dir),
+            Self::Local(value) => {
+                value.add_bot_with_provider(name, workspace, profile_dir, provider)
+            }
+            Self::Worker(value) => {
+                value.add_bot_with_provider(name, workspace, profile_dir, provider)
+            }
         }
     }
 
@@ -684,6 +713,12 @@ impl StudioConnection {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures and assertions can fail immediately"
+)]
 mod tests {
     use super::*;
     use crate::{AgentRunner, BotRecord, TaskStatus};
@@ -745,11 +780,31 @@ mod tests {
         let bot = client
             .add_bot("A", root.join("workspace"), root.join("profile"))
             .unwrap();
+        let claude_profile = root.join("claude-work");
+        let claude_bot = client
+            .add_bot_with_provider(
+                "Claude Work",
+                root.join("workspace"),
+                claude_profile.clone(),
+                AgentProvider::ClaudeCode,
+            )
+            .unwrap();
+        assert_eq!(
+            client
+                .submit_with_mode(claude_bot, "Try editing", AgentMode::EditWorktree)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
         let task = client
             .submit_with_mode(bot, "Describe it", AgentMode::Inspect)
             .unwrap();
         drop(client); // UI can exit without interrupting the running worker.
         let second = WorkerClient::connect(&socket).unwrap();
+        let state = second.snapshot().unwrap();
+        assert_eq!(state.bots[0].provider, AgentProvider::Codex);
+        assert_eq!(state.bots[1].provider, AgentProvider::ClaudeCode);
+        assert_eq!(state.bots[1].profile_dir, claude_profile);
         for _ in 0..200 {
             if second.snapshot().unwrap().tasks[0].status == TaskStatus::Succeeded {
                 break;

@@ -3,7 +3,7 @@
 **An open, lightweight, modular software factory for AI-powered development.**
 
 > **Status: pre-alpha / local Studio MVP.** The repository now contains a
-> native GUI, durable Bot/Task/Run records, and one-shot read-only Codex
+> native GUI, durable Bot/Task/Run records, and one-shot Codex and Claude Code
 > execution. It is not yet an unattended autonomous coding platform.
 
 [日本語 README](README.ja.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
@@ -38,7 +38,7 @@ itself** through reproducible tests, profiling and human-reviewed promotion.
 crates/
   kojora-core/      Experimental core types and scheduler policy
   kojora-runtime/   Experimental single-command process runner
-  kojora-agents/    Provider-neutral adapter trait and Codex CLI bootstrap
+  kojora-agents/    Pluggable Codex and Claude Code adapters
   kojora-cli/       Headless process/agent CLI
   kojora-studio/    Durable Bot/Task/Run controller (no GUI deps)
   kojora-desktop/   Native egui desktop application
@@ -51,7 +51,7 @@ docs/
 
 ## Build and run the bootstrap CLI
 
-A current stable Rust toolchain is required.
+Rustup selects the toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
 cargo test --workspace
@@ -62,17 +62,21 @@ cargo run -p kojora-cli -- run -- git --version
 # cargo run -p kojora-cli -- agent codex --profile /absolute/private/profile -- "Summarize this repository"
 ```
 
-`run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) and [Codex adapter](docs/AGENT_ADAPTER.md) for usage, privacy and limitations.
+`run` executes a **trusted** command without invoking a shell and saves private logs and JSONL lifecycle events in `.kojora/runs/`. It is **not** a daemon, sandbox or agent adapter. Read [Runner](docs/RUNNER.md) and [Agent adapters and account profiles](docs/AGENT_ADAPTER.md) for usage, privacy and limitations.
 
 ## Native Studio MVP (experimental)
 
 The desktop is written in Rust and runs locally on macOS or Linux. It shows
-Bot conversations, Task/Run/Session IDs, run status, bounded output and a
-read-only Codex prompt composer. An optional explicitly confirmed edit mode
-runs Codex only in a detached Git worktree, with a bounded diff viewer.
+Bot conversations, Task/Run/Session IDs, run status, bounded output, and
+a read-only prompt composer for Codex and Claude Code. Confirmed Codex edits
+run in a detached Git worktree with a bounded diff viewer.
 There is no automatic commit or push.
 
-Initialize a private Codex profile outside the project:
+Choose a provider and the absolute account-profile path when creating a Bot.
+Create one Bot per account to switch Claude Code profiles. See the
+[account setup guide](docs/AGENT_ADAPTER.md) for both providers.
+
+To initialize a private Codex profile outside the project:
 
 ```sh
 mkdir -p "$HOME/.config/kojora/profiles"
@@ -112,7 +116,7 @@ cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --stop
 
 **Resource semantics:** CPU seconds and virtual address space are *per process*,
 not wall time, physical RSS or the sum of descendants. Limits are optional;
-the Worker currently accepts one active task. See [Worker Daemon](docs/WORKER.md).
+the Worker defaults to one active task. See [Worker Daemon](docs/WORKER.md).
 
 ## Central local checks and hooks (experimental)
 
