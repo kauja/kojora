@@ -410,7 +410,6 @@ impl Studio {
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
-                let _instance_lock = instance_lock;
                 struct ActiveGuard {
                     active: Arc<AtomicBool>,
                     active_task: Arc<AtomicU64>,
@@ -428,6 +427,8 @@ impl Studio {
                     active_task,
                     cancellation: cancellation.clone(),
                 };
+                // Release the worker's lock before the guard publishes idle.
+                let _instance_lock = instance_lock;
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
                 let outcome = if cancellation.is_cancelled() {
                     Err(io::Error::new(
