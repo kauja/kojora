@@ -1,6 +1,7 @@
 //! Headless local studio control plane: durable bot/task/run records.
 //! No UI framework is used here. Execution is single-flight on purpose.
 
+pub mod checks;
 pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
@@ -133,6 +134,20 @@ pub type AgentRunner = dyn Fn(&BotRecord, &str, &Path, AgentMode, &CancellationT
     + Sync
     + 'static;
 
+/// An exclusive check slot shared with agent admission. Dropping this
+/// permit always makes the scheduler available again.
+pub struct CheckPermit {
+    scheduler: Arc<Mutex<Scheduler>>,
+}
+
+impl Drop for CheckPermit {
+    fn drop(&mut self) {
+        if let Ok(mut scheduler) = self.scheduler.lock() {
+            scheduler.finish_check();
+        }
+    }
+}
+
 pub struct Studio {
     root: PathBuf,
     state: Arc<Mutex<StudioState>>,
@@ -178,8 +193,16 @@ impl Studio {
         root: impl Into<PathBuf>,
         limits: kojora_runtime::ProcessLimits,
     ) -> io::Result<Self> {
+        Self::open_with_limits_and_policy(root, limits, AdmissionPolicy::single())
+    }
+
+    pub fn open_with_limits_and_policy(
+        root: impl Into<PathBuf>,
+        limits: kojora_runtime::ProcessLimits,
+        policy: AdmissionPolicy,
+    ) -> io::Result<Self> {
         limits.validate()?;
-        Self::open_with_runner(
+        Self::open_with_runner_and_policy(
             root,
             Arc::new(move |bot, prompt, log_root, mode, cancellation| {
                 let request = AgentRequest {
@@ -205,6 +228,7 @@ impl Studio {
                     ),
                 }
             }),
+            policy,
         )
     }
 
@@ -271,6 +295,16 @@ impl Studio {
 
     pub fn data_dir(&self) -> &Path {
         &self.root
+    }
+
+    pub fn try_acquire_check_slot(&self) -> io::Result<Option<CheckPermit>> {
+        let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
+        if !scheduler.try_begin_check() {
+            return Ok(None);
+        }
+        Ok(Some(CheckPermit {
+            scheduler: Arc::clone(&self.scheduler),
+        }))
     }
 
     pub fn is_active(&self) -> bool {

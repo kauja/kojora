@@ -114,6 +114,26 @@ cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --stop
 not wall time, physical RSS or the sum of descendants. Limits are optional;
 the Worker currently accepts one active task. See [Worker Daemon](docs/WORKER.md).
 
+## Central local checks and hooks (experimental)
+
+Kojora's Worker can serialize trusted lint and test checks in a bounded,
+durable queue. Check recipes are operator-configured fixed presets, **not
+arbitrary shell commands** supplied by AI agents.
+
+```sh
+cargo run --release -p kojora-worker -- \
+  --data-dir "$HOME/.local/state/kojora" \
+  --address-space-mib 8192 --cpu-seconds 900 \
+  --enable-checks --post-edit-check rustfmt --post-edit-check clippy \
+  --check-timeout-seconds 300 --max-pending-checks 16
+```
+
+Successful isolated edit tasks trigger the configured `post_edit` checks
+once. Use the GUI Worktree inspector to queue manual checks and view results.
+This is **only for trusted repositories**: Cargo build scripts and tests can
+execute project-controlled code. Read [Central Local Checks](docs/LOCAL_CHECKS.md).
+
+
 ## Open design questions
 
 - Versioned plugin contract: in-process Rust, WASM components and/or IPC

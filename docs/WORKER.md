@@ -24,10 +24,11 @@ the legacy standalone GUI default is a different state directory.
 - Only a private owner-only Unix-domain socket in a 0700 Studio directory.
 - The socket uses mode 0600; the client verifies socket and parent owner,
   type, and permissions before connecting. No TCP port or remote access.
-- Protocol v1 uses length-prefixed JSON frames with a 64-KiB request cap
+- Protocol v2 uses length-prefixed JSON frames with a 64-KiB request cap
   and explicit bounded replies. It carries no OAuth tokens or API keys.
 - RPC operations: status, snapshot, Bot creation, Task submission, Task
-  cancellation, bounded stdout/stderr logs, bounded worktree diff, shutdown.
+  cancellation, bounded stdout/stderr logs, bounded worktree diff,
+  named local-check enqueue/status/log queries, shutdown.
 - IPC callers are trusted processes running as the **same OS user**.
   This is not a security barrier between applications sharing that user.
 - The Worker holds the state lock; the GUI must not open that same state
@@ -47,6 +48,20 @@ The numeric limits are optional; without them the Worker does not apply
 process-specific memory/CPU ceilings. RLIMIT_AS can prevent a provider from
 starting if it reserves large virtual address ranges even at low RSS.
 Test values on the intended host before enabling them in production.
+
+## Centrally controlled local checks
+
+Operator CLI flags `--enable-checks`, `--post-edit-check rustfmt`,
+`--post-edit-check clippy`, `--check-timeout-seconds 300` and
+`--max-pending-checks 16` configure a private, persisted serial queue.
+Check clients can request only named built-in presets for existing detached
+task worktrees. See [Central Local Checks](LOCAL_CHECKS.md).
+
+The check queue and agent scheduler now **share an exclusive execution
+gate**: checks wait while agents are running, and new agents are refused
+while a check is executing. This is conservative backpressure, not an
+aggregate RSS/CPU quota, cgroup containment or fair queue scheduling.
+
 
 ## Known limitations
 
