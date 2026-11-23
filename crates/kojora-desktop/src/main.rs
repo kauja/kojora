@@ -16,11 +16,70 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COLOR_ACCENT: egui::Color32 = egui::Color32::from_rgb(114, 184, 255);
 const COLOR_SUCCESS: egui::Color32 = egui::Color32::from_rgb(112, 215, 160);
 const COLOR_ERROR: egui::Color32 = egui::Color32::from_rgb(250, 133, 130);
+const WORKER_RETRY_DELAY: Duration = Duration::from_millis(1500);
+
+struct WorkerStartup {
+    socket: PathBuf,
+    retry_at: Instant,
+    attempt: Option<mpsc::Receiver<io::Result<StudioConnection>>>,
+    error: Option<String>,
+}
+
+impl WorkerStartup {
+    fn poll(&mut self, ctx: &egui::Context, now: Instant) -> Option<StudioConnection> {
+        if let Some(attempt) = &self.attempt {
+            let result = match attempt.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(io::Error::other("Worker connection thread stopped"))
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(WORKER_RETRY_DELAY);
+                    return None;
+                }
+            };
+            self.attempt = None;
+            match result {
+                Ok(studio) => return Some(studio),
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.retry_at = now + WORKER_RETRY_DELAY;
+                }
+            }
+        }
+
+        if now >= self.retry_at {
+            let socket = self.socket.clone();
+            let ctx = ctx.clone();
+            let (sender, receiver) = mpsc::channel();
+            let spawn = thread::Builder::new()
+                .name("kojora-connect-worker".into())
+                .spawn(move || {
+                    let result = StudioConnection::connect_worker(socket);
+                    let _ = sender.send(result);
+                    ctx.request_repaint();
+                });
+            match spawn {
+                Ok(_) => self.attempt = Some(receiver),
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.retry_at = now + WORKER_RETRY_DELAY;
+                }
+            }
+        }
+        ctx.request_repaint_after(if self.attempt.is_some() {
+            WORKER_RETRY_DELAY
+        } else {
+            self.retry_at.saturating_duration_since(now)
+        });
+        None
+    }
+}
 
 enum DiffPreview {
     Loading(mpsc::Receiver<Result<String, String>>),
@@ -37,6 +96,7 @@ enum InspectorOutput {
 
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
+    worker_startup: Option<WorkerStartup>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
@@ -59,16 +119,25 @@ struct DesktopApp {
 
 impl DesktopApp {
     fn new(target: LaunchTarget) -> Self {
-        let result = match target {
-            LaunchTarget::Worker(socket) => StudioConnection::connect_worker(socket),
-            LaunchTarget::Local(root) => StudioConnection::open_local(root),
-        };
-        let (studio, error) = match result {
-            Ok(studio) => (Some(Arc::new(studio)), None),
-            Err(error) => (None, Some(error.to_string())),
+        let (studio, worker_startup, error) = match target {
+            LaunchTarget::Worker(socket) => (
+                None,
+                Some(WorkerStartup {
+                    socket,
+                    retry_at: Instant::now(),
+                    attempt: None,
+                    error: None,
+                }),
+                None,
+            ),
+            LaunchTarget::Local(root) => match StudioConnection::open_local(root) {
+                Ok(studio) => (Some(Arc::new(studio)), None, None),
+                Err(error) => (None, None, Some(error.to_string())),
+            },
         };
         Self {
             studio,
+            worker_startup,
             error,
             selected_bot: None,
             selected_task: None,
@@ -747,6 +816,23 @@ impl DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(startup) = &mut self.worker_startup {
+            if let Some(studio) = startup.poll(ctx, Instant::now()) {
+                self.studio = Some(Arc::new(studio));
+                self.worker_startup = None;
+            } else {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("Waiting for Kojora Worker");
+                    ui.label(startup.socket.display().to_string());
+                    if let Some(error) = &startup.error {
+                        ui.colored_label(COLOR_ERROR, error);
+                    }
+                    ui.label("Start the Worker to connect automatically.");
+                });
+                return;
+            }
+        }
+
         if let Some(error) = &self.error {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Kojora Studio could not open");
@@ -981,6 +1067,51 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn desktop_can_connect_after_starting_before_the_worker() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("kojora-late-worker-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let socket = root.join("worker.sock");
+        let app = DesktopApp::new(LaunchTarget::Worker(socket));
+        let mut startup = app
+            .worker_startup
+            .ok_or_else(|| io::Error::other("Worker startup is missing"))?;
+        let ctx = egui::Context::default();
+
+        for _ in 0..200 {
+            assert!(startup.poll(&ctx, Instant::now()).is_none());
+            if startup.error.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(startup.error.is_some(), "initial connection must fail");
+
+        let worker = kojora_studio::Studio::open(&root)?;
+        let server = thread::spawn(|| kojora_studio::worker::serve(worker, Default::default()));
+        let mut connected = None;
+        for _ in 0..500 {
+            connected = startup.poll(&ctx, Instant::now());
+            if connected.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let Some(StudioConnection::Worker(client)) = connected else {
+            return Err(io::Error::other(
+                "Desktop did not connect after Worker startup",
+            ));
+        };
+        assert!(client.snapshot()?.bots.is_empty());
+        client.shutdown()?;
+        server
+            .join()
+            .map_err(|_| io::Error::other("Worker thread panicked"))??;
+        fs::remove_dir_all(root)
+    }
 
     #[test]
     fn switching_tasks_resets_the_inspector_to_agent_stdout() {

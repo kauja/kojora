@@ -15,6 +15,8 @@ cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --stop
 ```
 
 The first command runs continuously (use a second terminal for the GUI).
+If Desktop opens before the Worker is ready, it retries the socket
+automatically.
 Codex CLI must be installed and its private profile initialized separately.
 The example uses an explicit directory on both Linux/macOS; on macOS
 the legacy standalone GUI default is a different state directory.
