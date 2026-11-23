@@ -5,10 +5,15 @@ use eframe::egui;
 use kojora_studio::{
     checks::{CheckKind, HookPhase},
     default_data_dir,
-    worker::StudioConnection,
+    worker::{StudioConnection, WorkerStatus},
     AgentMode, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
+use std::borrow::Cow;
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -22,13 +27,22 @@ enum DiffPreview {
     Ready(Result<String, String>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InspectorOutput {
+    #[default]
+    Agent,
+    Check(u64),
+    Diff,
+}
+
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
     error: Option<String>,
     selected_bot: Option<u64>,
     selected_task: Option<u64>,
-    selected_check: Option<u64>,
+    inspector_output: InspectorOutput,
     history_page: usize,
+    completed_responses: BTreeMap<u64, String>,
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
@@ -38,17 +52,16 @@ struct DesktopApp {
     notice: String,
     show_stderr: bool,
     show_raw_events: bool,
-    show_diff: bool,
     diff_preview: Option<(u64, DiffPreview)>,
     edit_mode: bool,
     confirm_edit: bool,
 }
 
 impl DesktopApp {
-    fn new(root: PathBuf, socket: Option<PathBuf>) -> Self {
-        let result = match socket {
-            Some(socket) => StudioConnection::connect_worker(socket),
-            None => StudioConnection::open_local(root),
+    fn new(target: LaunchTarget) -> Self {
+        let result = match target {
+            LaunchTarget::Worker(socket) => StudioConnection::connect_worker(socket),
+            LaunchTarget::Local(root) => StudioConnection::open_local(root),
         };
         let (studio, error) = match result {
             Ok(studio) => (Some(Arc::new(studio)), None),
@@ -59,8 +72,9 @@ impl DesktopApp {
             error,
             selected_bot: None,
             selected_task: None,
-            selected_check: None,
+            inspector_output: InspectorOutput::default(),
             history_page: 0,
+            completed_responses: BTreeMap::new(),
             adding_bot: false,
             new_bot_name: String::new(),
             new_workspace: std::env::current_dir()
@@ -73,10 +87,18 @@ impl DesktopApp {
             notice: String::new(),
             show_stderr: false,
             show_raw_events: false,
-            show_diff: false,
             diff_preview: None,
             edit_mode: false,
             confirm_edit: false,
+        }
+    }
+
+    fn select_task(&mut self, task: Option<u64>) {
+        if self.selected_task != task {
+            self.selected_task = task;
+            self.inspector_output = InspectorOutput::Agent;
+            self.show_stderr = false;
+            self.show_raw_events = false;
         }
     }
 
@@ -92,7 +114,7 @@ impl DesktopApp {
         ) {
             Ok(id) => {
                 self.selected_bot = Some(id);
-                self.selected_task = None;
+                self.select_task(None);
                 self.history_page = 0;
                 self.adding_bot = false;
                 self.new_bot_name.clear();
@@ -119,12 +141,9 @@ impl DesktopApp {
         };
         match studio.submit_with_mode(bot_id, &self.prompt, mode) {
             Ok(task_id) => {
-                self.selected_task = Some(task_id);
+                self.select_task(Some(task_id));
                 self.notice = format!("Task #{task_id} started.");
                 self.prompt.clear();
-                self.show_stderr = false;
-                self.show_raw_events = false;
-                self.show_diff = false;
             }
             Err(error) => {
                 self.notice = format!("Could not launch agent: {error}");
@@ -160,10 +179,8 @@ impl DesktopApp {
                     let label = format!("◉  {}", bot.name);
                     if ui.selectable_label(selected, label).clicked() {
                         self.selected_bot = Some(bot.id);
-                        self.selected_task = None;
+                        self.select_task(None);
                         self.history_page = 0;
-                        self.show_stderr = false;
-                        self.show_raw_events = false;
                         self.edit_mode = false;
                     }
                     ui.label(
@@ -216,7 +233,7 @@ impl DesktopApp {
         }
     }
 
-    fn header(&mut self, ui: &mut egui::Ui, state: &StudioState) {
+    fn header(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
         ui.horizontal(|ui| {
             ui.heading("Studio");
             ui.separator();
@@ -226,24 +243,34 @@ impl DesktopApp {
                 .map_or("Select a Bot", |bot| bot.name.as_str());
             ui.label(label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let active_task = self
-                    .studio
-                    .as_deref()
-                    .and_then(StudioConnection::active_task_id);
-                if let (Some(studio), Some(task_id)) = (&self.studio, active_task) {
-                    if studio.cancellation_requested(task_id) {
-                        ui.spinner();
-                        ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}..."));
-                    } else {
-                        if ui.button(format!("Stop task #{task_id}")).clicked() {
-                            self.notice = match studio.cancel_task(task_id) {
-                                Ok(()) => format!("Cancellation requested for task #{task_id}."),
-                                Err(error) => format!("Could not stop task: {error}"),
-                            };
-                        }
-                        ui.spinner();
-                        ui.colored_label(COLOR_ACCENT, "Agent running");
+                let stop_target = status
+                    .active_tasks
+                    .iter()
+                    .find(|task| Some(task.task_id) == self.selected_task)
+                    .or_else(|| status.active_tasks.first());
+                if let (Some(studio), Some(task)) = (&self.studio, stop_target) {
+                    let task_id = task.task_id;
+                    if task.cancellation_requested {
+                        ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}…"));
+                    } else if ui.button(format!("Stop task #{task_id}")).clicked() {
+                        self.notice = match studio.cancel_task(task_id) {
+                            Ok(()) => format!("Cancellation requested for task #{task_id}."),
+                            Err(error) => format!("Could not stop task: {error}"),
+                        };
                     }
+                }
+                if status.active_count > 0 {
+                    ui.spinner();
+                    ui.colored_label(
+                        COLOR_ACCENT,
+                        format!(
+                            "Active tasks {}/{}",
+                            status.active_count, status.concurrency
+                        ),
+                    );
+                } else if status.checks_pending > 0 {
+                    ui.spinner();
+                    ui.label("Local checks pending");
                 } else {
                     ui.colored_label(COLOR_SUCCESS, "Ready");
                 }
@@ -252,14 +279,12 @@ impl DesktopApp {
         if !self.notice.is_empty() {
             ui.label(egui::RichText::new(&self.notice).small().weak());
         }
-        if let Some(studio) = &self.studio {
-            if let Some(error) = studio.last_error() {
-                ui.colored_label(COLOR_ERROR, error);
-            }
+        if let Some(error) = &status.last_error {
+            ui.colored_label(COLOR_ERROR, error);
         }
     }
 
-    fn conversation(&mut self, ui: &mut egui::Ui, state: &StudioState) {
+    fn conversation(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
         let selected = self.selected_bot;
         let Some(bot_id) = selected else {
             ui.vertical_centered(|ui| {
@@ -305,7 +330,9 @@ impl DesktopApp {
             }
         });
         let end = tasks.len().saturating_sub(self.history_page * 60);
-        let start = end.saturating_sub(60);
+        let page = &tasks[end.saturating_sub(60)..end];
+        self.completed_responses
+            .retain(|id, _| page.iter().any(|task| task.id == *id));
 
         egui::ScrollArea::vertical()
             .id_salt(("conversation", self.history_page))
@@ -319,7 +346,7 @@ impl DesktopApp {
                         ui.label("Describe what you want the agent to inspect.");
                     });
                 }
-                for task in &tasks[start..end] {
+                for task in page {
                     let selected = self.selected_task == Some(task.id);
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -327,7 +354,7 @@ impl DesktopApp {
                                 .selectable_label(selected, format!("Task #{}", task.id))
                                 .clicked()
                             {
-                                self.selected_task = Some(task.id);
+                                self.select_task(Some(task.id));
                             }
                             status_label(ui, task.status);
                         });
@@ -339,12 +366,7 @@ impl DesktopApp {
                                     .small(),
                             );
                         }
-                        let response = self
-                            .studio
-                            .as_ref()
-                            .and_then(|studio| studio.read_log_tail(task.id, false).ok())
-                            .map(|raw| bot.provider.extract_text(&raw))
-                            .unwrap_or_default();
+                        let response = self.conversation_response(task, bot.provider);
                         if !response.is_empty() {
                             ui.separator();
                             ui.label(
@@ -356,10 +378,9 @@ impl DesktopApp {
                         } else if task.status == TaskStatus::Running {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                let stopping = self
-                                    .studio
-                                    .as_ref()
-                                    .is_some_and(|studio| studio.cancellation_requested(task.id));
+                                let stopping = status.active_tasks.iter().any(|active| {
+                                    active.task_id == task.id && active.cancellation_requested
+                                });
                                 ui.label(if stopping {
                                     "Stopping the agent and collecting logs..."
                                 } else {
@@ -379,7 +400,34 @@ impl DesktopApp {
             });
     }
 
-    fn inspector(&mut self, ui: &mut egui::Ui, state: &StudioState) {
+    fn conversation_response(
+        &mut self,
+        task: &TaskRecord,
+        provider: AgentProvider,
+    ) -> Cow<'_, str> {
+        let read = || {
+            self.studio
+                .as_ref()?
+                .read_log_tail(task.id, false)
+                .ok()
+                .map(|raw| provider.extract_text(&raw))
+        };
+        if matches!(
+            task.status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return match self.completed_responses.entry(task.id) {
+                Entry::Occupied(response) => Cow::Borrowed(response.into_mut()),
+                Entry::Vacant(slot) => match read() {
+                    Some(response) => Cow::Borrowed(slot.insert(response)),
+                    None => Cow::Borrowed(""),
+                },
+            };
+        }
+        Cow::Owned(read().unwrap_or_default())
+    }
+
+    fn inspector(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
         ui.add_space(12.0);
         ui.heading("Run inspector");
         ui.separator();
@@ -388,7 +436,7 @@ impl DesktopApp {
             return;
         };
         let Some(task) = state.tasks.iter().find(|task| task.id == task_id) else {
-            self.selected_task = None;
+            self.select_task(None);
             return;
         };
         ui.strong(format!("Task #{}", task.id));
@@ -431,44 +479,42 @@ impl DesktopApp {
             }
             if run.worktree_dir.is_some() && task.status != TaskStatus::Running {
                 if let Some(studio) = &self.studio {
-                    ui.separator();
-                    ui.label("Central checks (trusted worktrees only)");
-                    ui.horizontal_wrapped(|ui| {
-                        for (name, kind) in [
-                            ("Queue fmt", CheckKind::RustFmt),
-                            ("Queue clippy", CheckKind::RustClippy),
-                            ("Queue tests", CheckKind::RustTest),
-                        ] {
-                            if ui.small_button(name).clicked() {
-                                self.notice =
-                                    match studio.queue_check(task_id, HookPhase::Manual, kind) {
+                    if status.checks_enabled {
+                        ui.separator();
+                        ui.label("Central checks (trusted worktrees only)");
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, kind) in [
+                                ("Queue fmt", CheckKind::RustFmt),
+                                ("Queue clippy", CheckKind::RustClippy),
+                                ("Queue tests", CheckKind::RustTest),
+                            ] {
+                                if ui.small_button(name).clicked() {
+                                    self.notice = match studio.queue_check(
+                                        task_id,
+                                        HookPhase::Manual,
+                                        kind,
+                                    ) {
                                         Ok(id) => format!("Check #{id} queued by Worker"),
                                         Err(error) => format!("Cannot queue check: {error}"),
                                     };
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     if let Ok(checks) = studio.checks() {
                         for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
-                            ui.horizontal(|ui| {
-                                let label =
-                                    format!("#{} {:?}: {:?}", check.id, check.kind, check.status);
-                                if ui.small_button(label).clicked() {
-                                    self.selected_check = Some(check.id);
-                                    self.show_diff = false;
-                                }
-                            });
+                            ui.selectable_value(
+                                &mut self.inspector_output,
+                                InspectorOutput::Check(check.id),
+                                format!("#{} {:?}: {:?}", check.id, check.kind, check.status),
+                            );
                         }
-                        if let Some(check_id) = self.selected_check {
-                            if checks
+                        if let InspectorOutput::Check(check_id) = self.inspector_output {
+                            if !checks
                                 .iter()
                                 .any(|r| r.id == check_id && r.task_id == task_id)
                             {
-                                if ui.small_button("Return to agent log").clicked() {
-                                    self.selected_check = None;
-                                }
-                            } else {
-                                self.selected_check = None;
+                                self.inspector_output = InspectorOutput::Agent;
                             }
                         }
                     }
@@ -486,18 +532,22 @@ impl DesktopApp {
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.show_stderr, false, "Stdout");
-            ui.selectable_value(&mut self.show_stderr, true, "Stderr");
+            ui.selectable_value(
+                &mut self.inspector_output,
+                InspectorOutput::Agent,
+                "Agent log",
+            );
+            if task.mode == AgentMode::EditWorktree {
+                ui.selectable_value(
+                    &mut self.inspector_output,
+                    InspectorOutput::Diff,
+                    "Worktree diff",
+                );
+            }
         });
-        ui.checkbox(&mut self.show_raw_events, "Raw JSONL");
-        if task.mode == AgentMode::EditWorktree {
-            ui.checkbox(&mut self.show_diff, "Worktree diff");
-        } else {
-            self.show_diff = false;
-        }
-        ui.separator();
 
-        if self.selected_check.is_none() && self.show_diff {
+        if self.inspector_output == InspectorOutput::Diff {
+            ui.separator();
             if task.status == TaskStatus::Running {
                 ui.label("The worktree diff is available after the task finishes.");
             } else {
@@ -506,15 +556,24 @@ impl DesktopApp {
             return;
         }
 
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_stderr, false, "Stdout");
+            ui.selectable_value(&mut self.show_stderr, true, "Stderr");
+            if self.inspector_output == InspectorOutput::Agent && !self.show_stderr {
+                ui.checkbox(&mut self.show_raw_events, "Raw JSONL");
+            }
+        });
+        ui.separator();
+
         if let Some(studio) = &self.studio {
-            let output_result = if let Some(check_id) = self.selected_check {
+            let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
                 studio.check_log(check_id, self.show_stderr)
             } else {
                 studio.read_log_tail(task_id, self.show_stderr)
             };
             match output_result {
                 Ok(raw) => {
-                    let output = if self.selected_check.is_none()
+                    let output = if self.inspector_output == InspectorOutput::Agent
                         && !self.show_stderr
                         && !self.show_raw_events
                     {
@@ -620,7 +679,7 @@ impl DesktopApp {
         ui.ctx().request_repaint();
     }
 
-    fn composer(&mut self, ui: &mut egui::Ui, state: &StudioState) {
+    fn composer(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
         let provider = state
             .bots
             .iter()
@@ -630,10 +689,7 @@ impl DesktopApp {
         if !supports_edits {
             self.edit_mode = false;
         }
-        let active = self
-            .studio
-            .as_deref()
-            .is_some_and(|studio| studio.is_active());
+        let slots_available = status.active_count < status.concurrency;
         ui.horizontal(|ui| {
             ui.colored_label(COLOR_ACCENT, provider.label());
             ui.label(
@@ -661,10 +717,10 @@ impl DesktopApp {
         let edit = egui::TextEdit::multiline(&mut self.prompt)
             .hint_text("Ask the agent to inspect your project or explain an issue…")
             .desired_rows(3);
-        ui.add_enabled(!active && self.selected_bot.is_some(), edit);
+        ui.add_enabled(self.selected_bot.is_some(), edit);
         ui.horizontal(|ui| {
             let ready = !self.confirm_edit
-                && !active
+                && slots_available
                 && self.selected_bot.is_some()
                 && !self.prompt.trim().is_empty();
             let shortcut =
@@ -682,9 +738,8 @@ impl DesktopApp {
                 }
             }
             ui.label(egui::RichText::new("Cmd/Ctrl+Enter to send").small().weak());
-            if active {
-                ui.spinner();
-                ui.label("One task at a time");
+            if !slots_available {
+                ui.label("Task slots full");
             }
         });
     }
@@ -692,18 +747,6 @@ impl DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(
-            if self
-                .studio
-                .as_deref()
-                .is_some_and(|studio| studio.is_active())
-            {
-                350
-            } else {
-                1500
-            },
-        ));
-
         if let Some(error) = &self.error {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Kojora Studio could not open");
@@ -716,13 +759,28 @@ impl eframe::App for DesktopApp {
         let Some(studio) = &self.studio else {
             return;
         };
-        let state = match studio.snapshot() {
-            Ok(state) => state,
+        let (status, state) = match studio
+            .status()
+            .and_then(|status| Ok((status, studio.snapshot()?)))
+        {
+            Ok(update) => update,
             Err(error) => {
-                self.notice = error.to_string();
+                ctx.request_repaint_after(Duration::from_millis(1500));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("Studio connection unavailable");
+                    ui.colored_label(COLOR_ERROR, error.to_string());
+                    ui.label("Retrying connection…");
+                });
                 return;
             }
         };
+        ctx.request_repaint_after(Duration::from_millis(
+            if status.active_count > 0 || status.checks_pending > 0 {
+                350
+            } else {
+                1500
+            },
+        ));
         if self.selected_bot.is_none() {
             self.selected_bot = state.bots.first().map(|bot| bot.id);
         }
@@ -731,7 +789,7 @@ impl eframe::App for DesktopApp {
             .min_height(68.0)
             .show(ctx, |ui| {
                 ui.add_space(7.0);
-                self.header(ui, &state);
+                self.header(ui, &state, &status);
             });
 
         egui::SidePanel::left("bots")
@@ -746,18 +804,18 @@ impl eframe::App for DesktopApp {
             .resizable(true)
             .default_width(330.0)
             .min_width(260.0)
-            .show(ctx, |ui| self.inspector(ui, &state));
+            .show(ctx, |ui| self.inspector(ui, &state, &status));
 
         egui::TopBottomPanel::bottom("composer")
             .resizable(false)
             .min_height(130.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, &state));
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, &state, &status));
                 ui.add_space(7.0);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, &state));
+        egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, &state, &status));
 
         if self.confirm_edit {
             let modal = egui::Modal::new(egui::Id::new("confirm-isolated-edit")).show(ctx, |ui| {
@@ -837,58 +895,127 @@ fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
     ui.colored_label(color, status.label());
 }
 
-fn main() -> eframe::Result<()> {
-    let mut data_dir = match default_data_dir() {
-        Ok(dir) => dir,
+const USAGE: &str =
+    "Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]";
+
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchTarget {
+    Local(PathBuf),
+    Worker(PathBuf),
+}
+
+fn launch_target(
+    mut args: impl Iterator<Item = OsString>,
+    default_path: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<Option<LaunchTarget>> {
+    let mut data_dir = None;
+    let mut worker_socket = None;
+    while let Some(arg) = args.next() {
+        let destination = match arg.to_string_lossy().as_ref() {
+            "--data-dir" => &mut data_dir,
+            "--worker-socket" => &mut worker_socket,
+            "-h" | "--help" => return Ok(None),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument {arg:?}; run kojora-desktop --help"),
+                ))
+            }
+        };
+        let path = args.next().map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{arg:?} requires an absolute path"),
+            )
+        })?;
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{arg:?} requires an absolute path"),
+            ));
+        }
+        *destination = Some(path);
+    }
+    let target = match worker_socket {
+        Some(socket) => LaunchTarget::Worker(socket),
+        None => LaunchTarget::Local(data_dir.map_or_else(default_path, Ok)?),
+    };
+    Ok(Some(target))
+}
+
+fn main() -> ExitCode {
+    let target = match launch_target(std::env::args_os().skip(1), default_data_dir) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(error) => {
-            eprintln!("Could not determine studio data directory: {error}");
-            return Ok(());
+            eprintln!("kojora-desktop: {error}");
+            return ExitCode::FAILURE;
         }
     };
-    let mut worker_socket = None;
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.to_string_lossy().as_ref() {
-            "--data-dir" => match args.next() {
-                Some(path) => data_dir = PathBuf::from(path),
-                None => {
-                    eprintln!("--data-dir requires an absolute directory");
-                    return Ok(());
-                }
-            },
-            "--worker-socket" => match args.next() {
-                Some(path) => worker_socket = Some(PathBuf::from(path)),
-                None => {
-                    eprintln!("--worker-socket requires an absolute socket path");
-                    return Ok(());
-                }
-            },
-            _ => {
-                eprintln!("Usage: kojora-desktop [--data-dir ABSOLUTE_DIR] [--worker-socket ABSOLUTE_SOCKET]");
-                return Ok(());
-            }
-        }
-    }
-    if !data_dir.is_absolute() || worker_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
-        eprintln!("Data directory and worker socket paths must be absolute");
-        return Ok(());
-    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1250.0, 800.0])
             .with_min_inner_size([940.0, 650.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    match eframe::run_native(
         "Kojora Studio",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_cjk_fallback(&cc.egui_ctx);
-            Ok(Box::new(DesktopApp::new(
-                data_dir.clone(),
-                worker_socket.clone(),
-            )))
+            Ok(Box::new(DesktopApp::new(target)))
         }),
-    )
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("kojora-desktop: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_tasks_resets_the_inspector_to_agent_stdout() {
+        let mut app = DesktopApp::new(LaunchTarget::Local(PathBuf::new()));
+        app.select_task(Some(1));
+        app.inspector_output = InspectorOutput::Check(7);
+        app.show_stderr = true;
+        app.show_raw_events = true;
+
+        app.select_task(Some(1));
+        assert_eq!(app.inspector_output, InspectorOutput::Check(7));
+
+        app.select_task(Some(2));
+        assert_eq!(app.selected_task, Some(2));
+        assert_eq!(app.inspector_output, InspectorOutput::Agent);
+        assert!(!app.show_stderr);
+        assert!(!app.show_raw_events);
+    }
+
+    #[test]
+    fn explicit_directory_and_socket_do_not_require_a_default() {
+        let unavailable = || Err(io::Error::new(io::ErrorKind::NotFound, "HOME is unset"));
+        for (flag, target) in [
+            ("--data-dir", LaunchTarget::Local("/tmp/kojora".into())),
+            (
+                "--worker-socket",
+                LaunchTarget::Worker("/tmp/kojora".into()),
+            ),
+        ] {
+            let result = launch_target(
+                [flag, "/tmp/kojora"].into_iter().map(OsString::from),
+                unavailable,
+            );
+            assert!(matches!(result, Ok(Some(actual)) if actual == target));
+        }
+        assert!(launch_target(std::iter::empty(), unavailable).is_err());
+    }
 }

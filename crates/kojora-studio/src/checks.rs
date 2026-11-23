@@ -402,7 +402,7 @@ impl CheckQueue {
             record.task_id == task_id
                 && record.hook == hook
                 && record.kind == kind
-                && (hook != HookPhase::Manual
+                && (hook == HookPhase::PostEdit
                     || matches!(record.status, CheckStatus::Queued | CheckStatus::Running))
         }) {
             return Ok(existing.id);
@@ -864,6 +864,39 @@ mod tests {
             reopened.snapshot().unwrap()[0].status,
             CheckStatus::Succeeded
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_pre_merge_checks_can_be_queued_again() {
+        let (root, mut policy, worktree) = setup();
+        policy.pre_merge = vec![CheckKind::RustFmt];
+        let runner: Arc<CheckRunner> =
+            Arc::new(|_, _, _, _, _| Err(io::Error::other("fixture result")));
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        let first = checks
+            .enqueue(1, HookPhase::PreMerge, CheckKind::RustFmt, &worktree)
+            .unwrap();
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(checks.pending_count(), 0);
+        fs::write(worktree.join("changed.txt"), "new contents").unwrap();
+        let second = checks
+            .enqueue(1, HookPhase::PreMerge, CheckKind::RustFmt, &worktree)
+            .unwrap();
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(checks.pending_count(), 0);
+        assert!(second > first);
+        drop(checks);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -57,10 +57,11 @@ stored beneath `runs/task-ID/RUN-DIR` in the private data directory. Output
 may contain source code, personal content or credentials emitted by Codex;
 never commit or share your state directory.
 
-The controller enforces **one active Codex process at a time**, launching on
-a background thread rather than blocking the graphical event loop. The
-Codex adapter runs with a cleared environment and a private credential
-profile, and requests a read-only sandbox.
+Standalone Studio runs one active task at a time on a background thread.
+Worker-connected Studio can run multiple tasks with distinct profiles when
+[parallel slots are configured](WORKER.md#quickstart). The Codex adapter
+runs with a cleared environment and a private credential profile, and
+requests a read-only sandbox by default.
 
 The headless `kojora agent codex` CLI still works independently of the GUI.
 Desktop dependencies do not enter the runtime, agent adapter or Studio
@@ -102,7 +103,7 @@ controller. Default workspace builds exclude the GUI.
   process group may survive, and abruptly closing or killing Studio itself
   still risks orphaned processes. The UI warns users not to close while
   running. Windows process-tree termination is not implemented.
-- There is no multi-agent scheduling, automatic timeouts, autonomous PR
+- Agent tasks have no waiting queue, automatic timeouts, autonomous PR
   creation, integrated terminal, or resource telemetry.
 - Every task creates one new Run/Session ID, but underlying Codex conversations
   are **not resumed** across prompts. Chat-like display is only a local

@@ -309,6 +309,13 @@ impl Studio {
             .map_or_else(|_| Vec::new(), |s| s.active_ids())
     }
 
+    #[cfg(unix)]
+    pub(crate) fn active_task_statuses(&self) -> Vec<(u64, bool)> {
+        self.scheduler
+            .lock()
+            .map_or_else(|_| Vec::new(), |s| s.active_task_statuses())
+    }
+
     /// Compatibility with the single-task GUI; parallel clients use all IDs.
     pub fn active_task_id(&self) -> Option<u64> {
         self.active_task_ids().into_iter().next()

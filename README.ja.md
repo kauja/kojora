@@ -92,7 +92,8 @@ cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/koj
 
 **注意：** `RLIMIT_AS` は実メモリRSSではなく仮想アドレス空間の上限、
 `RLIMIT_CPU` は壁時計時間ではなく各プロセスのCPU消費秒数です。
-合算したリソース使用量や並列処理を制御するものではなく、同時実行はまだ1件です。
+どちらもプロセス単位で適用されます。Workerの同時実行は既定で1件です。
+別々の認証プロファイルを用意し、同時実行数とメモリ予約枠を設定すると並列実行できます。
 Worker自体のクラッシュ復旧・孤児プロセス回収は未実装です。
 詳しくは[Worker Daemonガイド](docs/WORKER.md)をご覧ください。
 

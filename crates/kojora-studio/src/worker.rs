@@ -22,6 +22,12 @@ const VERSION: u32 = 3;
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024 + 4096;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveTaskStatus {
+    pub task_id: u64,
+    pub cancellation_requested: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatus {
     pub protocol: u32,
@@ -29,6 +35,8 @@ pub struct WorkerStatus {
     pub data_dir: PathBuf,
     pub active_task: Option<u64>,
     pub cancellation_requested: bool,
+    #[serde(default)]
+    pub active_tasks: Vec<ActiveTaskStatus>,
     pub address_space_mib: Option<u64>,
     pub cpu_seconds: Option<u64>,
     pub concurrency: u32,
@@ -145,21 +153,30 @@ fn transmit<T: Serialize>(stream: &mut UnixStream, message: &T, max: usize) -> i
     Ok(())
 }
 
-fn status(studio: &Studio, limits: ProcessLimits, checks: &CheckQueue) -> WorkerStatus {
-    let active_task = studio.active_task_id();
+fn status(studio: &Studio, limits: ProcessLimits, checks: Option<&CheckQueue>) -> WorkerStatus {
+    let active_tasks: Vec<_> = studio
+        .active_task_statuses()
+        .into_iter()
+        .map(|(task_id, cancellation_requested)| ActiveTaskStatus {
+            task_id,
+            cancellation_requested,
+        })
+        .collect();
+    let first = active_tasks.first();
     WorkerStatus {
         protocol: VERSION,
         pid: std::process::id(),
         data_dir: studio.data_dir().to_owned(),
-        active_task,
-        cancellation_requested: active_task.is_some_and(|id| studio.cancellation_requested(id)),
+        active_task: first.map(|task| task.task_id),
+        cancellation_requested: first.is_some_and(|task| task.cancellation_requested),
         address_space_mib: limits.address_space_mib,
         cpu_seconds: limits.cpu_seconds,
         concurrency: studio.max_parallel() as u32,
-        active_count: studio.active_task_count() as u32,
+        active_count: active_tasks.len() as u32,
+        active_tasks,
         reserved_memory_mib: studio.reserved_memory_mib(),
-        checks_pending: checks.pending_count() as u32,
-        checks_enabled: checks.is_enabled(),
+        checks_pending: checks.map_or(0, |queue| queue.pending_count() as u32),
+        checks_enabled: checks.is_some_and(CheckQueue::is_enabled),
         last_error: studio.last_error(),
     }
 }
@@ -171,7 +188,10 @@ fn dispatch(
     request: Request,
 ) -> io::Result<(Response, bool)> {
     let (response, shutdown) = match request {
-        Request::Status => (Response::Status(status(studio, limits, checks)), false),
+        Request::Status => (
+            Response::Status(status(studio, limits, Some(checks))),
+            false,
+        ),
         Request::Snapshot => (Response::Snapshot(studio.snapshot()?), false),
         Request::Checks => (Response::Checks(checks.snapshot()?), false),
         Request::CheckLog { check_id, stderr } => (
@@ -236,10 +256,19 @@ fn dispatch(
         ),
         Request::Diff { task_id } => (Response::Text(studio.read_worktree_diff(task_id)?), false),
         Request::Shutdown => {
-            if studio.is_active() || checks.pending_count() != 0 {
+            if studio.is_active() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "worker has active tasks or checks; cancel/wait for completion",
+                    "worker has active tasks; cancel or wait for completion",
+                ));
+            }
+            if checks.has_post_edit_hooks() {
+                checks.observe_post_edit(&studio.snapshot()?);
+            }
+            if checks.pending_count() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "worker has pending checks; wait for completion",
                 ));
             }
             (Response::Ok, true)
@@ -440,7 +469,17 @@ impl WorkerClient {
 
     pub fn status(&self) -> io::Result<WorkerStatus> {
         match self.request(Request::Status)? {
-            Response::Status(value) => Ok(value),
+            Response::Status(mut value) => {
+                if value.active_tasks.is_empty() {
+                    value
+                        .active_tasks
+                        .extend(value.active_task.map(|task_id| ActiveTaskStatus {
+                            task_id,
+                            cancellation_requested: value.cancellation_requested,
+                        }));
+                }
+                Ok(value)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "expected worker status",
@@ -580,6 +619,13 @@ pub enum StudioConnection {
 }
 
 impl StudioConnection {
+    pub fn status(&self) -> io::Result<WorkerStatus> {
+        match self {
+            Self::Local(studio) => Ok(status(studio, ProcessLimits::default(), None)),
+            Self::Worker(worker) => worker.status(),
+        }
+    }
+
     pub fn open_local(root: impl Into<PathBuf>) -> io::Result<Self> {
         Studio::open(root).map(Self::Local)
     }
@@ -682,7 +728,10 @@ impl StudioConnection {
         match self {
             Self::Local(value) => value.cancellation_requested(task_id),
             Self::Worker(value) => value.status().is_ok_and(|status| {
-                status.active_task == Some(task_id) && status.cancellation_requested
+                status
+                    .active_tasks
+                    .iter()
+                    .any(|task| task.task_id == task_id && task.cancellation_requested)
             }),
         }
     }
@@ -761,6 +810,141 @@ mod tests {
                 })
             },
         )
+    }
+
+    #[test]
+    fn status_reports_cancellation_for_the_selected_parallel_task() {
+        let root = test_root();
+        let release = Arc::new(AtomicBool::new(false));
+        let allow_finish = Arc::clone(&release);
+        let fake = fake_runner();
+        let runner: Arc<AgentRunner> = Arc::new(move |bot, prompt, log, mode, token| {
+            while !allow_finish.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            fake(bot, prompt, log, mode, token)
+        });
+        let studio = Studio::open_with_runner_and_policy(
+            &root,
+            runner,
+            crate::scheduler::AdmissionPolicy {
+                max_parallel: 2,
+                memory_mib_per_task: 128,
+                total_memory_mib: 256,
+            },
+        )
+        .unwrap();
+        let first = studio
+            .add_bot("First", root.join("project"), root.join("first"))
+            .unwrap();
+        let second = studio
+            .add_bot("Second", root.join("project"), root.join("second"))
+            .unwrap();
+        let first = studio.submit(first, "Read from account one").unwrap();
+        let second = studio.submit(second, "Read from account two").unwrap();
+        studio.cancel_task(second).unwrap();
+        let activity = status(&studio, ProcessLimits::default(), None);
+        release.store(true, Ordering::Release);
+        assert_eq!(activity.concurrency, 2);
+        assert_eq!(activity.active_count, 2);
+        assert_eq!(activity.active_task, Some(first));
+        assert_eq!(
+            activity.active_tasks,
+            vec![
+                ActiveTaskStatus {
+                    task_id: first,
+                    cancellation_requested: false
+                },
+                ActiveTaskStatus {
+                    task_id: second,
+                    cancellation_requested: true
+                },
+            ]
+        );
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_observes_newly_completed_edit_tasks() {
+        let root = test_root();
+        let worktree = root.join("worktrees/task-1");
+        fs::create_dir_all(&worktree).unwrap();
+        let limits = ProcessLimits {
+            address_space_mib: Some(8192),
+            cpu_seconds: Some(60),
+        };
+        let policy = CheckPolicy {
+            enabled: true,
+            limits,
+            post_edit: vec![CheckKind::RustFmt],
+            ..CheckPolicy::default()
+        };
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let checks = CheckQueue::open_with_admission(
+            root.join("checks"),
+            policy,
+            Arc::new(move || {
+                if gate.load(Ordering::Acquire) {
+                    return Err(io::Error::other("fixture prevents running a real check"));
+                }
+                Ok(None)
+            }),
+        )
+        .unwrap();
+        let finished_ms = crate::unix_ms().unwrap();
+        let state = StudioState {
+            next_id: 4,
+            tasks: vec![crate::TaskRecord {
+                id: 1,
+                run_id: 2,
+                bot_id: 3,
+                prompt: "Completed edit".into(),
+                mode: AgentMode::EditWorktree,
+                status: TaskStatus::Succeeded,
+                created_ms: finished_ms,
+            }],
+            runs: vec![crate::RunRecord {
+                id: 2,
+                task_id: 1,
+                session_id: 3,
+                status: TaskStatus::Succeeded,
+                started_ms: finished_ms,
+                finished_ms: Some(finished_ms),
+                exit_code: Some(0),
+                run_dir: None,
+                worktree_dir: Some(worktree),
+                error: None,
+            }],
+            ..StudioState::default()
+        };
+        crate::persist(&root, &state).unwrap();
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let shutdown = dispatch(&studio, limits, &checks, Request::Shutdown);
+        release.store(true, Ordering::Release);
+        assert_eq!(shutdown.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(checks.snapshot().unwrap()[0].hook, HookPhase::PostEdit);
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            dispatch(&studio, limits, &checks, Request::Shutdown).unwrap(),
+            (Response::Ok, true)
+        ));
+        drop(checks);
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
