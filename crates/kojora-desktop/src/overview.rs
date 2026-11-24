@@ -28,10 +28,6 @@ impl OverviewRefresh {
         self.discard_pending = self.pending.is_some();
     }
 
-    pub fn needs_refresh(&self) -> bool {
-        self.next_update.is_none() && self.pending.is_none()
-    }
-
     pub fn poll(
         &mut self,
         ctx: &egui::Context,

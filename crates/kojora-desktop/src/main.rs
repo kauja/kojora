@@ -1,9 +1,11 @@
 //! Kojora Studio: bot-first native desktop user interface.
 //! The headless kojora-studio crate owns storage and execution.
 
+mod actions;
 mod output;
 mod overview;
 
+use actions::{ActionOutcome, Actions};
 use eframe::egui;
 use kojora_studio::{
     checks::{CheckKind, HookPhase},
@@ -100,6 +102,7 @@ enum InspectorOutput {
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
     overview: OverviewRefresh,
+    actions: Actions,
     worker_startup: Option<WorkerStartup>,
     error: Option<String>,
     selected_bot: Option<u64>,
@@ -142,6 +145,7 @@ impl DesktopApp {
         Self {
             studio,
             overview: OverviewRefresh::default(),
+            actions: Actions::default(),
             worker_startup,
             error,
             selected_bot: None,
@@ -176,18 +180,31 @@ impl DesktopApp {
         }
     }
 
-    fn create_bot(&mut self) {
-        let Some(studio) = &self.studio else {
+    fn start_action(
+        &mut self,
+        ctx: &egui::Context,
+        waiting: &str,
+        failure: &'static str,
+        run: impl FnOnce(&StudioConnection) -> io::Result<ActionOutcome> + Send + 'static,
+    ) {
+        let Some(studio) = self.studio.clone() else {
             return;
         };
-        match studio.add_bot_with_provider(
-            &self.new_bot_name,
-            PathBuf::from(&self.new_workspace),
-            PathBuf::from(&self.new_profile),
-            self.new_provider,
-        ) {
-            Ok(id) => {
-                self.overview.invalidate();
+        self.notice = match self.actions.start(ctx, failure, move || run(&studio)) {
+            Ok(()) => waiting.into(),
+            Err(error) => format!("{failure}: {error}"),
+        };
+    }
+
+    fn apply_action_result(&mut self) {
+        let Some(result) = self.actions.poll() else {
+            return;
+        };
+        if result.is_ok() {
+            self.overview.invalidate();
+        }
+        match result {
+            Ok(ActionOutcome::BotCreated(id)) => {
                 self.selected_bot = Some(id);
                 self.select_task(None);
                 self.history_page = 0;
@@ -197,16 +214,35 @@ impl DesktopApp {
                 self.edit_mode = false;
                 self.notice = "Bot created.".into();
             }
-            Err(error) => self.notice = format!("Could not create bot: {error}"),
+            Ok(ActionOutcome::TaskStarted(task_id)) => {
+                self.select_task(Some(task_id));
+                self.notice = format!("Task #{task_id} started.");
+                self.prompt.clear();
+            }
+            Ok(ActionOutcome::Notice(message)) | Err(message) => self.notice = message,
         }
     }
 
-    fn send_prompt(&mut self) {
+    fn create_bot(&mut self, ctx: &egui::Context) {
+        let name = self.new_bot_name.clone();
+        let workspace = PathBuf::from(&self.new_workspace);
+        let profile = PathBuf::from(&self.new_profile);
+        let provider = self.new_provider;
+        self.start_action(
+            ctx,
+            "Creating bot…",
+            "Could not create bot",
+            move |studio| {
+                studio
+                    .add_bot_with_provider(&name, workspace, profile, provider)
+                    .map(ActionOutcome::BotCreated)
+            },
+        );
+    }
+
+    fn send_prompt(&mut self, ctx: &egui::Context) {
         let Some(bot_id) = self.selected_bot else {
             self.notice = "Select or create a bot first.".into();
-            return;
-        };
-        let Some(studio) = &self.studio else {
             return;
         };
         let mode = if self.edit_mode {
@@ -214,17 +250,17 @@ impl DesktopApp {
         } else {
             AgentMode::Inspect
         };
-        match studio.submit_with_mode(bot_id, &self.prompt, mode) {
-            Ok(task_id) => {
-                self.overview.invalidate();
-                self.select_task(Some(task_id));
-                self.notice = format!("Task #{task_id} started.");
-                self.prompt.clear();
-            }
-            Err(error) => {
-                self.notice = format!("Could not launch agent: {error}");
-            }
-        }
+        let prompt = self.prompt.clone();
+        self.start_action(
+            ctx,
+            "Submitting task…",
+            "Could not launch agent",
+            move |studio| {
+                studio
+                    .submit_with_mode(bot_id, &prompt, mode)
+                    .map(ActionOutcome::TaskStarted)
+            },
+        );
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, state: &StudioState) {
@@ -294,7 +330,7 @@ impl DesktopApp {
                         .weak(),
                     );
                     if ui.button("Create bot").clicked() {
-                        self.create_bot();
+                        self.create_bot(ui.ctx());
                     }
                 }
             });
@@ -324,18 +360,28 @@ impl DesktopApp {
                     .iter()
                     .find(|task| Some(task.task_id) == self.selected_task)
                     .or_else(|| status.active_tasks.first());
-                if let (Some(studio), Some(task)) = (&self.studio, stop_target) {
+                if let Some(task) = stop_target {
                     let task_id = task.task_id;
                     if task.cancellation_requested {
                         ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}…"));
-                    } else if ui.button(format!("Stop task #{task_id}")).clicked() {
-                        self.notice = match studio.cancel_task(task_id) {
-                            Ok(()) => {
-                                self.overview.invalidate();
-                                format!("Cancellation requested for task #{task_id}.")
-                            }
-                            Err(error) => format!("Could not stop task: {error}"),
-                        };
+                    } else if ui
+                        .add_enabled(
+                            !self.actions.is_busy(),
+                            egui::Button::new(format!("Stop task #{task_id}")),
+                        )
+                        .clicked()
+                    {
+                        self.start_action(
+                            ui.ctx(),
+                            "Requesting cancellation…",
+                            "Could not stop task",
+                            move |studio| {
+                                studio.cancel_task(task_id)?;
+                                Ok(ActionOutcome::Notice(format!(
+                                    "Cancellation requested for task #{task_id}."
+                                )))
+                            },
+                        );
                     }
                 }
                 if status.active_count > 0 {
@@ -550,47 +596,52 @@ impl DesktopApp {
                 }
             }
             if run.worktree_dir.is_some() && task.status != TaskStatus::Running {
-                if let Some(studio) = &self.studio {
-                    if status.checks_enabled {
-                        ui.separator();
-                        ui.label("Central checks (trusted worktrees only)");
-                        ui.horizontal_wrapped(|ui| {
-                            for (name, kind) in [
-                                ("Queue fmt", CheckKind::RustFmt),
-                                ("Queue clippy", CheckKind::RustClippy),
-                                ("Queue tests", CheckKind::RustTest),
-                            ] {
-                                if ui.small_button(name).clicked() {
-                                    self.notice = match studio.queue_check(
-                                        task_id,
-                                        HookPhase::Manual,
-                                        kind,
-                                    ) {
-                                        Ok(id) => {
-                                            self.overview.invalidate();
-                                            format!("Check #{id} queued by Worker")
-                                        }
-                                        Err(error) => format!("Cannot queue check: {error}"),
-                                    };
-                                }
-                            }
-                        });
-                    }
-                    if let Some(checks) = checks {
-                        for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
-                            ui.selectable_value(
-                                &mut self.inspector_output,
-                                InspectorOutput::Check(check.id),
-                                format!("#{} {:?}: {:?}", check.id, check.kind, check.status),
-                            );
-                        }
-                        if let InspectorOutput::Check(check_id) = self.inspector_output {
-                            if !checks
-                                .iter()
-                                .any(|r| r.id == check_id && r.task_id == task_id)
+                if status.checks_enabled {
+                    ui.separator();
+                    ui.label("Central checks (trusted worktrees only)");
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, kind) in [
+                            ("Queue fmt", CheckKind::RustFmt),
+                            ("Queue clippy", CheckKind::RustClippy),
+                            ("Queue tests", CheckKind::RustTest),
+                        ] {
+                            if ui
+                                .add_enabled(
+                                    !self.actions.is_busy(),
+                                    egui::Button::new(name).small(),
+                                )
+                                .clicked()
                             {
-                                self.inspector_output = InspectorOutput::Agent;
+                                self.start_action(
+                                    ui.ctx(),
+                                    "Queuing check…",
+                                    "Cannot queue check",
+                                    move |studio| {
+                                        let id =
+                                            studio.queue_check(task_id, HookPhase::Manual, kind)?;
+                                        Ok(ActionOutcome::Notice(format!(
+                                            "Check #{id} queued by Worker"
+                                        )))
+                                    },
+                                );
                             }
+                        }
+                    });
+                }
+                if let Some(checks) = checks {
+                    for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
+                        ui.selectable_value(
+                            &mut self.inspector_output,
+                            InspectorOutput::Check(check.id),
+                            format!("#{} {:?}: {:?}", check.id, check.kind, check.status),
+                        );
+                    }
+                    if let InspectorOutput::Check(check_id) = self.inspector_output {
+                        if !checks
+                            .iter()
+                            .any(|r| r.id == check_id && r.task_id == task_id)
+                        {
+                            self.inspector_output = InspectorOutput::Agent;
                         }
                     }
                 }
@@ -795,6 +846,7 @@ impl DesktopApp {
         ui.add_enabled(self.selected_bot.is_some(), edit);
         ui.horizontal(|ui| {
             let ready = !self.confirm_edit
+                && !self.actions.is_busy()
                 && slots_available
                 && self.selected_bot.is_some()
                 && !self.prompt.trim().is_empty();
@@ -809,7 +861,7 @@ impl DesktopApp {
                 if self.edit_mode {
                     self.confirm_edit = true;
                 } else {
-                    self.send_prompt();
+                    self.send_prompt(ui.ctx());
                 }
             }
             ui.label(egui::RichText::new("Cmd/Ctrl+Enter to send").small().weak());
@@ -851,6 +903,7 @@ impl eframe::App for DesktopApp {
         let Some(studio) = self.studio.clone() else {
             return;
         };
+        self.apply_action_result();
         let log_studio = Arc::clone(&studio);
         let overview = self.overview.poll(ctx, Instant::now(), move || {
             let status = studio.status()?;
@@ -904,7 +957,9 @@ impl eframe::App for DesktopApp {
             .default_width(240.0)
             .min_width(190.0)
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.sidebar(ui, state));
+                ui.add_enabled_ui(!self.confirm_edit && !self.actions.is_busy(), |ui| {
+                    self.sidebar(ui, state)
+                });
             });
 
         egui::SidePanel::right("inspector")
@@ -918,7 +973,9 @@ impl eframe::App for DesktopApp {
             .min_height(130.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, state, status));
+                ui.add_enabled_ui(!self.confirm_edit && !self.actions.is_busy(), |ui| {
+                    self.composer(ui, state, status)
+                });
                 ui.add_space(7.0);
             });
 
@@ -943,11 +1000,8 @@ impl eframe::App for DesktopApp {
             let (approved, cancelled) = modal.inner;
             self.confirm_edit = !(approved || cancelled || modal.should_close());
             if approved {
-                self.send_prompt();
+                self.send_prompt(ctx);
             }
-        }
-        if self.overview.needs_refresh() {
-            ctx.request_repaint();
         }
         self.outputs
             .finish_frame(ctx, Instant::now(), move |source| source.read(&log_studio));
