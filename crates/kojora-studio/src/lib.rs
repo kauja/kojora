@@ -34,6 +34,8 @@ use std::os::unix::process::CommandExt;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
+// Space for both status changes, terminal fields, and a short diagnostic.
+const RUN_COMPLETION_FIELDS_BYTES: usize = 512;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_LOG_TAIL_BYTES: usize = 32 * 1024;
 const WORKTREE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(8);
@@ -554,7 +556,7 @@ impl Studio {
                     run.error = error;
                     run.finished_ms = unix_ms().ok();
                 }
-                if let Err(error) = commit_state(&root, &mut state, candidate) {
+                if let Err(error) = commit_finished_state(&root, &mut state, candidate, run_id) {
                     if let Ok(mut value) = last_error.lock() {
                         *value = Some(format!("could not save completed run: {error}"));
                     }
@@ -572,7 +574,7 @@ impl Studio {
                 run.error = Some(error.to_string());
                 run.finished_ms = unix_ms().ok();
             }
-            commit_state(&self.root, &mut state, candidate)?;
+            commit_finished_state(&self.root, &mut state, candidate, run_id)?;
             return Err(error);
         }
 
@@ -956,14 +958,66 @@ fn commit_state(root: &Path, shared: &mut StudioState, candidate: StudioState) -
     Ok(())
 }
 
-fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
+fn commit_finished_state(
+    root: &Path,
+    shared: &mut StudioState,
+    mut candidate: StudioState,
+    run_id: u64,
+) -> io::Result<()> {
+    let bytes = match encode_state(root, &candidate) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let run = candidate.runs.iter_mut().find(|run| run.id == run_id);
+            if let Some(run) = run {
+                run.run_dir = None;
+                if run.error.is_some() {
+                    run.error = Some("Run error omitted because Studio metadata is full".into());
+                }
+            }
+            encode_state(root, &candidate)?
+        }
+        Err(error) => return Err(error),
+    };
+    write_state(root, &bytes)?;
+    *shared = candidate;
+    Ok(())
+}
+
+fn encode_state(root: &Path, state: &StudioState) -> io::Result<Vec<u8>> {
+    let running = state
+        .runs
+        .iter()
+        .filter(|run| run.status == TaskStatus::Running);
+    let mut budget = MAX_STATE_BYTES as usize;
+    if running.clone().next().is_some() {
+        // Include the escaped state path plus the suffix of a generated run or worktree directory.
+        let path_bytes = serde_json::to_vec(root).map_err(io::Error::other)?.len() + 96;
+        for run in running {
+            budget = budget.saturating_sub(RUN_COMPLETION_FIELDS_BYTES + path_bytes);
+            if run.worktree_dir.is_none() {
+                budget = budget.saturating_sub(path_bytes);
+            }
+        }
+    }
+    let mut bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+    if bytes.len() > budget {
+        // Preserve existing history, including recovery of pre-existing Running records.
+        bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    }
+    if bytes.len() > budget {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "studio state exceeds the 4 MiB metadata limit",
+            "studio state exceeds the 4 MiB metadata limit including active run reservations",
         ));
     }
+    Ok(bytes)
+}
+
+fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
+    write_state(root, &encode_state(root, state)?)
+}
+
+fn write_state(root: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = root.join(format!("state-{}-{}.tmp", std::process::id(), unix_ms()?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -971,7 +1025,7 @@ fn persist(root: &Path, state: &StudioState) -> io::Result<()> {
     options.mode(0o600);
     let mut file = options.open(&tmp)?;
     let result = (|| -> io::Result<()> {
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, root.join("state.json"))?;
         // After rename, the new file is already visible. A directory sync
@@ -1037,6 +1091,122 @@ mod tests {
                 stderr_bytes: 0,
             })
         })
+    }
+
+    fn history_near_limit(root: &Path, margin_after_submit: usize) -> StudioState {
+        let now = unix_ms().unwrap();
+        let mut state = StudioState {
+            next_id: 5,
+            ..StudioState::default()
+        };
+        state.bots.push(BotRecord {
+            id: 1,
+            name: "Bot".into(),
+            workspace: root.join("project"),
+            profile_dir: root.join("profile"),
+            provider: AgentProvider::Codex,
+        });
+        state.tasks.push(TaskRecord {
+            id: 2,
+            bot_id: 1,
+            run_id: 3,
+            prompt: "Historical task".into(),
+            mode: AgentMode::Inspect,
+            status: TaskStatus::Failed,
+            created_ms: now,
+        });
+        state.runs.push(RunRecord {
+            id: 3,
+            session_id: 4,
+            task_id: 2,
+            status: TaskStatus::Failed,
+            started_ms: now,
+            finished_ms: Some(now),
+            exit_code: Some(1),
+            run_dir: None,
+            worktree_dir: None,
+            error: None,
+        });
+        let mut submitted = state.clone();
+        submitted.next_id = 8;
+        submitted.tasks.push(TaskRecord {
+            id: 5,
+            bot_id: 1,
+            run_id: 6,
+            prompt: "Next task".into(),
+            mode: AgentMode::Inspect,
+            status: TaskStatus::Running,
+            created_ms: now,
+        });
+        submitted.runs.push(RunRecord {
+            id: 6,
+            session_id: 7,
+            task_id: 5,
+            status: TaskStatus::Running,
+            started_ms: now,
+            finished_ms: None,
+            exit_code: None,
+            run_dir: None,
+            worktree_dir: None,
+            error: None,
+        });
+        let remaining =
+            MAX_STATE_BYTES as usize - serde_json::to_vec_pretty(&submitted).unwrap().len();
+        // Pad the old metadata so a new Running record fits but its full outcome does not.
+        state.runs[0].error = Some("x".repeat(remaining - margin_after_submit));
+        state
+    }
+
+    #[test]
+    fn nearly_full_history_refuses_a_task_that_cannot_reserve_completion_space() {
+        let root = temporary_root("history-budget");
+        persist(&root, &history_near_limit(&root, 16)).unwrap();
+
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let submitted = studio.submit(1, "Next task");
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let persisted = read_state(&root).unwrap();
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(submitted.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(persisted.tasks.len(), 1);
+        assert_eq!(persisted.tasks[0].prompt, "Historical task");
+    }
+
+    #[test]
+    fn oversized_diagnostic_cannot_prevent_a_finished_task_from_being_saved() {
+        let root = temporary_root("history-diagnostic");
+        persist(&root, &history_near_limit(&root, 2048)).unwrap();
+        let runner: Arc<AgentRunner> =
+            Arc::new(|_, _, _, _, _| Err(io::Error::other("large error ".repeat(4096))));
+
+        let studio = Studio::open_with_runner(&root, runner).unwrap();
+        let task_id = studio.submit(1, "Next task").unwrap();
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+        assert!(studio.last_error().is_none());
+        let state = read_state(&root).unwrap();
+        assert_eq!(state.tasks[1].id, task_id);
+        assert_eq!(state.tasks[1].status, TaskStatus::Failed);
+        assert_eq!(state.runs[1].status, TaskStatus::Failed);
+        assert!(state.runs[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("metadata is full"));
+        drop(studio);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1140,7 +1310,11 @@ mod tests {
             worktree_dir: None,
             error: None,
         });
-        persist(&root, &state).unwrap();
+        // Legacy Studio allowed a Running state to fill the entire metadata file.
+        let initial_len = serde_json::to_vec_pretty(&state).unwrap().len();
+        let prompt_len = state.tasks[0].prompt.len() + (MAX_STATE_BYTES as usize - initial_len);
+        state.tasks[0].prompt = "x".repeat(prompt_len);
+        write_state(&root, &serde_json::to_vec_pretty(&state).unwrap()).unwrap();
         let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
         assert_eq!(
             studio.snapshot().unwrap().tasks[0].status,
@@ -1150,6 +1324,7 @@ mod tests {
             studio.snapshot().unwrap().runs[0].status,
             TaskStatus::Interrupted
         );
+        assert_eq!(studio.snapshot().unwrap().tasks[0].prompt.len(), prompt_len);
         drop(studio);
         fs::remove_dir_all(root).unwrap();
     }
