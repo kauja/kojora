@@ -1,6 +1,8 @@
 //! Kojora Studio: bot-first native desktop user interface.
 //! The headless kojora-studio crate owns storage and execution.
 
+mod overview;
+
 use eframe::egui;
 use kojora_studio::{
     checks::{CheckKind, HookPhase},
@@ -8,6 +10,7 @@ use kojora_studio::{
     worker::{StudioConnection, WorkerStatus},
     AgentMode, AgentOutput, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
+use overview::{OverviewRefresh, StudioOverview};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -138,6 +141,7 @@ impl AgentOutputCache {
 
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
+    overview: OverviewRefresh,
     worker_startup: Option<WorkerStartup>,
     error: Option<String>,
     selected_bot: Option<u64>,
@@ -179,6 +183,7 @@ impl DesktopApp {
         };
         Self {
             studio,
+            overview: OverviewRefresh::default(),
             worker_startup,
             error,
             selected_bot: None,
@@ -224,6 +229,7 @@ impl DesktopApp {
             self.new_provider,
         ) {
             Ok(id) => {
+                self.overview.invalidate();
                 self.selected_bot = Some(id);
                 self.select_task(None);
                 self.history_page = 0;
@@ -252,6 +258,7 @@ impl DesktopApp {
         };
         match studio.submit_with_mode(bot_id, &self.prompt, mode) {
             Ok(task_id) => {
+                self.overview.invalidate();
                 self.select_task(Some(task_id));
                 self.notice = format!("Task #{task_id} started.");
                 self.prompt.clear();
@@ -365,7 +372,10 @@ impl DesktopApp {
                         ui.colored_label(COLOR_ERROR, format!("Stopping task #{task_id}…"));
                     } else if ui.button(format!("Stop task #{task_id}")).clicked() {
                         self.notice = match studio.cancel_task(task_id) {
-                            Ok(()) => format!("Cancellation requested for task #{task_id}."),
+                            Ok(()) => {
+                                self.overview.invalidate();
+                                format!("Cancellation requested for task #{task_id}.")
+                            }
                             Err(error) => format!("Could not stop task: {error}"),
                         };
                     }
@@ -524,7 +534,12 @@ impl DesktopApp {
         })
     }
 
-    fn inspector(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
+    fn inspector(&mut self, ui: &mut egui::Ui, view: &StudioOverview) {
+        let StudioOverview {
+            state,
+            status,
+            checks,
+        } = view;
         ui.add_space(12.0);
         ui.heading("Run inspector");
         ui.separator();
@@ -591,14 +606,17 @@ impl DesktopApp {
                                         HookPhase::Manual,
                                         kind,
                                     ) {
-                                        Ok(id) => format!("Check #{id} queued by Worker"),
+                                        Ok(id) => {
+                                            self.overview.invalidate();
+                                            format!("Check #{id} queued by Worker")
+                                        }
                                         Err(error) => format!("Cannot queue check: {error}"),
                                     };
                                 }
                             }
                         });
                     }
-                    if let Ok(checks) = studio.checks() {
+                    if let Some(checks) = checks {
                         for check in checks.iter().rev().filter(|r| r.task_id == task_id).take(5) {
                             ui.selectable_value(
                                 &mut self.inspector_output,
@@ -872,31 +890,44 @@ impl eframe::App for DesktopApp {
             return;
         }
 
-        let Some(studio) = &self.studio else {
+        let Some(studio) = self.studio.clone() else {
             return;
         };
-        let (status, state) = match studio
-            .status()
-            .and_then(|status| Ok((status, studio.snapshot()?)))
-        {
-            Ok(update) => update,
-            Err(error) => {
-                ctx.request_repaint_after(Duration::from_millis(1500));
+        let overview = self.overview.poll(ctx, Instant::now(), move || {
+            let status = studio.status()?;
+            let state = studio.snapshot()?;
+            let checks = if matches!(studio.as_ref(), StudioConnection::Worker(_))
+                && state.runs.iter().any(|run| run.worktree_dir.is_some())
+            {
+                studio.checks().ok()
+            } else {
+                None
+            };
+            Ok(StudioOverview {
+                status,
+                state,
+                checks,
+            })
+        });
+        let view = match overview {
+            Some(Ok(view)) => view,
+            Some(Err(error)) => {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading("Studio connection unavailable");
-                    ui.colored_label(COLOR_ERROR, error.to_string());
+                    ui.colored_label(COLOR_ERROR, error);
                     ui.label("Retrying connection…");
                 });
                 return;
             }
+            None => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.spinner();
+                    ui.label("Loading Studio…");
+                });
+                return;
+            }
         };
-        ctx.request_repaint_after(Duration::from_millis(
-            if status.active_count > 0 || status.checks_pending > 0 {
-                350
-            } else {
-                1500
-            },
-        ));
+        let StudioOverview { status, state, .. } = view.as_ref();
         if self.selected_bot.is_none() {
             self.selected_bot = state.bots.first().map(|bot| bot.id);
         }
@@ -906,7 +937,7 @@ impl eframe::App for DesktopApp {
             .min_height(68.0)
             .show(ctx, |ui| {
                 ui.add_space(7.0);
-                self.header(ui, &state, &status);
+                self.header(ui, state, status);
             });
 
         egui::SidePanel::left("bots")
@@ -914,25 +945,25 @@ impl eframe::App for DesktopApp {
             .default_width(240.0)
             .min_width(190.0)
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.sidebar(ui, &state));
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.sidebar(ui, state));
             });
 
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(330.0)
             .min_width(260.0)
-            .show(ctx, |ui| self.inspector(ui, &state, &status));
+            .show(ctx, |ui| self.inspector(ui, &view));
 
         egui::TopBottomPanel::bottom("composer")
             .resizable(false)
             .min_height(130.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, &state, &status));
+                ui.add_enabled_ui(!self.confirm_edit, |ui| self.composer(ui, state, status));
                 ui.add_space(7.0);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, &state, &status));
+        egui::CentralPanel::default().show(ctx, |ui| self.conversation(ui, state, status));
 
         if self.confirm_edit {
             let modal = egui::Modal::new(egui::Id::new("confirm-isolated-edit")).show(ctx, |ui| {
@@ -955,6 +986,9 @@ impl eframe::App for DesktopApp {
             if approved {
                 self.send_prompt();
             }
+        }
+        if self.overview.needs_refresh() {
+            ctx.request_repaint();
         }
     }
 }
