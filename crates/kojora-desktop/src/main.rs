@@ -6,7 +6,7 @@ use kojora_studio::{
     checks::{CheckKind, HookPhase},
     default_data_dir,
     worker::{StudioConnection, WorkerStatus},
-    AgentMode, AgentProvider, StudioState, TaskRecord, TaskStatus,
+    AgentMode, AgentOutput, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
 use std::borrow::Cow;
 use std::collections::{btree_map::Entry, BTreeMap};
@@ -477,9 +477,12 @@ impl DesktopApp {
         let read = || {
             self.studio
                 .as_ref()?
-                .read_log_tail(task.id, false)
+                .read_agent_output(task.id, provider)
                 .ok()
-                .map(|raw| provider.extract_text(&raw))
+                .map(|output| match output {
+                    AgentOutput::Message(text) => text,
+                    AgentOutput::Raw(_) => String::new(),
+                })
         };
         if matches!(
             task.status,
@@ -637,29 +640,20 @@ impl DesktopApp {
         if let Some(studio) = &self.studio {
             let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
                 studio.check_log(check_id, self.show_stderr)
+            } else if !self.show_stderr && !self.show_raw_events {
+                let provider = state
+                    .bots
+                    .iter()
+                    .find(|bot| bot.id == task.bot_id)
+                    .map_or(AgentProvider::default(), |bot| bot.provider);
+                studio
+                    .read_agent_output(task_id, provider)
+                    .map(AgentOutput::into_text)
             } else {
                 studio.read_log_tail(task_id, self.show_stderr)
             };
             match output_result {
-                Ok(raw) => {
-                    let output = if self.inspector_output == InspectorOutput::Agent
-                        && !self.show_stderr
-                        && !self.show_raw_events
-                    {
-                        let provider = state
-                            .bots
-                            .iter()
-                            .find(|bot| bot.id == task.bot_id)
-                            .map_or(AgentProvider::default(), |bot| bot.provider);
-                        let text = provider.extract_text(&raw);
-                        if text.is_empty() {
-                            raw
-                        } else {
-                            text
-                        }
-                    } else {
-                        raw
-                    };
+                Ok(output) => {
                     egui::ScrollArea::vertical()
                         .id_salt("inspector")
                         .auto_shrink([false, false])
@@ -682,7 +676,7 @@ impl DesktopApp {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "Only the latest 32 KiB is loaded. Logs may contain sensitive model output.",
+                "This view shows the latest output. Logs may contain sensitive model output.",
             )
             .small()
             .weak(),

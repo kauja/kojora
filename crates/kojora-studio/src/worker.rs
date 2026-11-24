@@ -5,7 +5,10 @@
 #![cfg(unix)]
 
 use crate::checks::{CheckKind, CheckPolicy, CheckQueue, CheckRecord, HookPhase};
-use crate::{AgentMode, AgentProvider, Studio, StudioState, TaskStatus, WORKTREE_PREVIEW_TIMEOUT};
+use crate::{
+    AgentMode, AgentOutput, AgentProvider, Studio, StudioState, TaskStatus,
+    WORKTREE_PREVIEW_TIMEOUT,
+};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -80,6 +83,8 @@ enum Request {
     Log {
         task_id: u64,
         stderr: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<AgentProvider>,
     },
     Diff {
         task_id: u64,
@@ -95,6 +100,7 @@ enum Response {
     Checks(Vec<CheckRecord>),
     Id(u64),
     Text(String),
+    AgentOutput(AgentOutput),
     Ok,
     Error { kind: String, message: String },
 }
@@ -253,7 +259,17 @@ fn dispatch(
             studio.cancel_task(task_id)?;
             (Response::Ok, false)
         }
-        Request::Log { task_id, stderr } => (
+        Request::Log {
+            task_id,
+            stderr: false,
+            provider: Some(provider),
+        } => (
+            Response::AgentOutput(studio.read_agent_output(task_id, provider)?),
+            false,
+        ),
+        Request::Log {
+            task_id, stderr, ..
+        } => (
             Response::Text(studio.read_log_tail(task_id, stderr)?),
             false,
         ),
@@ -667,11 +683,35 @@ impl WorkerClient {
     }
 
     pub fn read_log_tail(&self, task_id: u64, stderr: bool) -> io::Result<String> {
-        match self.request(Request::Log { task_id, stderr })? {
+        match self.request(Request::Log {
+            task_id,
+            stderr,
+            provider: None,
+        })? {
             Response::Text(value) => Ok(value),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "expected log text",
+            )),
+        }
+    }
+
+    pub fn read_agent_output(
+        &self,
+        task_id: u64,
+        provider: AgentProvider,
+    ) -> io::Result<AgentOutput> {
+        match self.request(Request::Log {
+            task_id,
+            stderr: false,
+            provider: Some(provider),
+        })? {
+            Response::AgentOutput(value) => Ok(value),
+            // An older v3 worker ignores the optional provider and returns a raw log tail.
+            Response::Text(raw) => Ok(AgentOutput::from_log(provider, raw)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected agent output",
             )),
         }
     }
@@ -836,6 +876,17 @@ impl StudioConnection {
         match self {
             Self::Local(value) => value.read_log_tail(task_id, stderr),
             Self::Worker(value) => value.read_log_tail(task_id, stderr),
+        }
+    }
+
+    pub fn read_agent_output(
+        &self,
+        task_id: u64,
+        provider: AgentProvider,
+    ) -> io::Result<AgentOutput> {
+        match self {
+            Self::Local(value) => value.read_agent_output(task_id, provider),
+            Self::Worker(value) => value.read_agent_output(task_id, provider),
         }
     }
 
@@ -1131,6 +1182,78 @@ mod tests {
         assert_eq!(state.tasks[0].id, task_id);
         assert_eq!(state.tasks[0].prompt, prompt);
         assert_eq!(state.tasks[0].status, TaskStatus::Succeeded);
+    }
+
+    #[test]
+    fn worker_keeps_the_tail_of_large_assistant_messages() {
+        let root = test_root();
+        let fake = fake_runner();
+        let runner: Arc<AgentRunner> = Arc::new(move |bot, prompt, log, mode, token| {
+            let mut outcome = fake(bot, prompt, log, mode, token)?;
+            let text = format!("{} end of response", "返".repeat(18_000));
+            let event = match bot.provider {
+                AgentProvider::Codex => serde_json::json!({
+                    "type": "item.completed", "item": {"type": "agent_message", "text": text}
+                }),
+                AgentProvider::ClaudeCode => serde_json::json!({
+                    "type": "assistant", "message": {"content": [{"type": "text", "text": text}]}
+                }),
+            };
+            let json = format!("{event}\n");
+            fs::write(outcome.run_dir.join("stdout.log"), &json)?;
+            outcome.stdout_bytes = json.len() as u64;
+            Ok(outcome)
+        });
+        let studio = Studio::open_with_runner(&root, runner).unwrap();
+        let socket = root.join("worker.sock");
+        let server = thread::spawn(move || serve(studio, ProcessLimits::default()));
+        let mut connected = None;
+        for _ in 0..200 {
+            if let Ok(client) = WorkerClient::connect(&socket) {
+                connected = Some(client);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let client = connected.unwrap();
+        let mut output = Vec::new();
+        for provider in AgentProvider::ALL {
+            let bot = client
+                .add_bot_with_provider(
+                    provider.label(),
+                    root.join("project"),
+                    root.join("profile"),
+                    provider,
+                )
+                .unwrap();
+            let task = client
+                .submit_with_mode(bot, "Report", AgentMode::Inspect)
+                .unwrap();
+            for _ in 0..200 {
+                if client.status().unwrap().active_count == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let raw = client.read_log_tail(task, false).unwrap();
+            assert!(provider.extract_text(&raw).is_empty());
+            output.push((provider, client.read_agent_output(task, provider).unwrap()));
+        }
+        client.shutdown().unwrap();
+        server.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        for (provider, output) in output {
+            let AgentOutput::Message(text) = output else {
+                panic!("{provider:?} returned raw text instead of the assistant message");
+            };
+            assert!(
+                text.ends_with(" end of response"),
+                "{provider:?} lost the response tail"
+            );
+            assert!(text.starts_with("[earlier output omitted]\n"));
+            assert!(text.len() <= crate::MAX_LOG_TAIL_BYTES);
+        }
     }
 
     #[test]

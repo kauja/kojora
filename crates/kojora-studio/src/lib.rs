@@ -38,6 +38,7 @@ const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const RUN_COMPLETION_FIELDS_BYTES: usize = 512;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_LOG_TAIL_BYTES: usize = 32 * 1024;
+const MAX_AGENT_LOG_SCAN_BYTES: usize = 256 * 1024;
 const WORKTREE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// This state file only holds metadata and user prompts, never credentials.
@@ -137,6 +138,29 @@ pub struct RunRecord {
     #[serde(default)]
     pub worktree_dir: Option<PathBuf>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AgentOutput {
+    Message(String),
+    Raw(String),
+}
+
+impl AgentOutput {
+    fn from_log(provider: AgentProvider, log: String) -> Self {
+        let message = provider.extract_text(&log);
+        if message.is_empty() {
+            Self::Raw(preview_tail(log))
+        } else {
+            Self::Message(preview_tail(message))
+        }
+    }
+
+    pub fn into_text(self) -> String {
+        match self {
+            Self::Message(text) | Self::Raw(text) => text,
+        }
+    }
 }
 
 /// A runner can be replaced by a credential-free fake in automated tests.
@@ -643,6 +667,20 @@ impl Studio {
 
     /// Read only the last 32 KiB of the stdout/stderr log, never the whole log.
     pub fn read_log_tail(&self, task_id: u64, stderr: bool) -> io::Result<String> {
+        self.read_task_log(task_id, stderr, MAX_LOG_TAIL_BYTES)
+    }
+
+    /// Scan a wider stdout window for complete provider events before bounding the display text.
+    pub fn read_agent_output(
+        &self,
+        task_id: u64,
+        provider: AgentProvider,
+    ) -> io::Result<AgentOutput> {
+        let stdout = self.read_task_log(task_id, false, MAX_AGENT_LOG_SCAN_BYTES)?;
+        Ok(AgentOutput::from_log(provider, stdout))
+    }
+
+    fn read_task_log(&self, task_id: u64, stderr: bool, max_bytes: usize) -> io::Result<String> {
         let known = self
             .state
             .lock()
@@ -675,7 +713,7 @@ impl Studio {
             return Ok(String::new());
         };
         let filename = if stderr { "stderr.log" } else { "stdout.log" };
-        tail_file(&run_dir.join(filename), MAX_LOG_TAIL_BYTES)
+        tail_file(&run_dir.join(filename), max_bytes)
     }
 }
 
@@ -902,6 +940,15 @@ fn tail_file(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut buffer = Vec::with_capacity((size - start) as usize);
     file.take(max_bytes as u64).read_to_end(&mut buffer)?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn preview_tail(mut text: String) -> String {
+    if text.len() > MAX_LOG_TAIL_BYTES {
+        let notice = "[earlier output omitted]\n";
+        let start = text.ceil_char_boundary(text.len() + notice.len() - MAX_LOG_TAIL_BYTES);
+        text.replace_range(..start, notice);
+    }
+    text
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {

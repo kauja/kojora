@@ -56,7 +56,9 @@ finish. When the file has insufficient space, Studio rejects new metadata
 before starting another task. It preserves existing history and can shorten
 oversized run diagnostics to save the terminal status.
 
-The GUI only loads the last 32 KiB of each selected log stream. Logs are
+The raw log viewer reads the last 32 KiB of the selected stream. The formatted
+assistant view scans up to 256 KiB of stdout for complete events and displays
+up to 32 KiB of text. Logs are
 stored beneath `runs/task-ID/RUN-DIR` in the private data directory. Output
 may contain source code, personal content or credentials emitted by Codex;
 never commit or share your state directory.
