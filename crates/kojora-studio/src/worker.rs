@@ -279,14 +279,52 @@ fn dispatch(
 
 fn serve_one(
     mut stream: UnixStream,
-    studio: &Studio,
+    studio: &Arc<Studio>,
     limits: ProcessLimits,
     checks: &CheckQueue,
+    preview: &mut Option<thread::JoinHandle<()>>,
 ) -> io::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let request: Request = receive(&mut stream, MAX_REQUEST)?;
-    let (response, shutdown) = match dispatch(studio, limits, checks, request) {
+
+    if preview
+        .as_ref()
+        .is_some_and(thread::JoinHandle::is_finished)
+    {
+        if let Some(finished) = preview.take() {
+            let _ = finished.join();
+        }
+    }
+    if preview.is_some() && matches!(request, Request::Diff { .. } | Request::Shutdown) {
+        return reply(
+            stream,
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "worker is preparing a worktree diff; wait for it to finish",
+            )),
+        );
+    }
+    if matches!(request, Request::Diff { .. }) {
+        let studio = Arc::clone(studio);
+        let checks = checks.clone();
+        *preview = Some(
+            thread::Builder::new()
+                .name("kojora-worker-diff".into())
+                .spawn(move || {
+                    if let Err(error) = reply(stream, dispatch(&studio, limits, &checks, request)) {
+                        eprintln!("worker diff client error: {error}");
+                    }
+                })?,
+        );
+        return Ok(false);
+    }
+
+    reply(stream, dispatch(studio, limits, checks, request))
+}
+
+fn reply(mut stream: UnixStream, result: io::Result<(Response, bool)>) -> io::Result<bool> {
+    let (response, shutdown) = match result {
         Ok(result) => result,
         Err(error) => (
             Response::Error {
@@ -381,9 +419,10 @@ pub fn serve_with_checks(
         std::process::id(),
         socket.display()
     );
+    let mut preview = None;
     for accepted in listener.incoming() {
         match accepted {
-            Ok(stream) => match serve_one(stream, &studio, limits, &checks) {
+            Ok(stream) => match serve_one(stream, &studio, limits, &checks, &mut preview) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(error) => eprintln!("worker client error: {error}"),
@@ -1008,6 +1047,131 @@ mod tests {
         server.join().unwrap().unwrap();
         assert!(!socket.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn slow_worktree_diff_keeps_status_and_cancellation_available() {
+        let root = test_root().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        let git = |args: &[&str]| {
+            assert!(crate::git_command(&project)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init"]);
+        fs::write(project.join("file.txt"), "before\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&[
+            "-c",
+            "user.name=Kojora",
+            "-c",
+            "user.email=kojora@example.invalid",
+            "commit",
+            "-m",
+            "Initial",
+        ]);
+        let monitor = root.join("fsmonitor");
+        fs::write(
+            &monitor,
+            "#!/bin/sh\n: > .monitor-started\ncount=0\nwhile [ ! -f .monitor-release ] && [ \"$count\" -lt 350 ]; do\n  sleep 0.02\n  count=$((count+1))\ndone\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&monitor, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let fake = fake_runner();
+        let runner: Arc<AgentRunner> = Arc::new(move |bot, prompt, logs, mode, token| {
+            if mode == AgentMode::EditWorktree {
+                fs::write(bot.workspace.join("file.txt"), "after\n")?;
+                return fake(bot, prompt, logs, mode, token);
+            }
+            for _ in 0..800 {
+                if token.is_cancelled() {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        let state_dir = root.join("state");
+        let studio = Studio::open_with_runner(&state_dir, runner).unwrap();
+        let bot = studio
+            .add_bot("Bot", project.clone(), root.join("profile"))
+            .unwrap();
+        let edit = studio
+            .submit_with_mode(bot, "Edit", AgentMode::EditWorktree)
+            .unwrap();
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = studio.snapshot().unwrap();
+        assert_eq!(state.tasks[0].status, TaskStatus::Succeeded);
+        let worktree = state.runs[0].worktree_dir.as_ref().unwrap();
+        git(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
+
+        let socket = state_dir.join("worker.sock");
+        let server = thread::spawn(move || serve(studio, ProcessLimits::default()));
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(connected) = WorkerClient::connect(&socket) {
+                client = Some(connected);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let client = client.unwrap();
+        let inspect = client
+            .submit_with_mode(bot, "Inspect", AgentMode::Inspect)
+            .unwrap();
+        let preview_client = client.clone();
+        let diff = thread::spawn(move || preview_client.read_worktree_diff(edit));
+        for _ in 0..200 {
+            if worktree.join(".monitor-started").exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worktree.join(".monitor-started").exists());
+
+        let activity = client.status();
+        let (cancel, second_preview) = if activity.is_ok() {
+            (client.cancel_task(inspect), client.read_worktree_diff(edit))
+        } else {
+            (
+                Err(io::Error::other("status was blocked")),
+                Ok(String::new()),
+            )
+        };
+        fs::write(worktree.join(".monitor-release"), "").unwrap();
+        let diff = diff.join().unwrap();
+        if cancel.is_err() {
+            let _ = client.cancel_task(inspect);
+        }
+        let stopped = (0..200).any(|_| match client.shutdown() {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+            Err(error) => panic!("could not stop Worker: {error}"),
+        });
+        assert!(stopped, "Worker did not stop after the preview finished");
+        server.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(activity.unwrap().active_task, Some(inspect));
+        cancel.unwrap();
+        assert_eq!(
+            second_preview.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(diff.unwrap().contains("+after"));
     }
 
     #[test]
