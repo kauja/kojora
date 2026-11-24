@@ -340,10 +340,18 @@ fn reply(mut stream: UnixStream, result: io::Result<(Response, bool)>) -> io::Re
     Ok(shutdown)
 }
 
-struct SocketGuard(PathBuf);
+struct SocketGuard {
+    path: PathBuf,
+    metadata: fs::Metadata,
+}
+
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|current| same_socket(&self.metadata, &current))
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -373,6 +381,9 @@ pub fn serve_with_checks(
     policy: CheckPolicy,
 ) -> io::Result<()> {
     limits.validate()?;
+    let socket = studio.data_dir().join("worker.sock");
+    // Studio already holds the exclusive lock for this private directory.
+    remove_stale_socket(&socket)?;
     let studio = Arc::new(studio);
     let for_checks = Arc::clone(&studio);
     let checks = CheckQueue::open_with_admission(
@@ -405,16 +416,11 @@ pub fn serve_with_checks(
             handle: None,
         }
     };
-    // Studio::open already checked that the root is an absolute, private,
-    // real directory. Do not require a canonical spelling: on macOS /var
-    // commonly resolves to /private/var.
-    let socket = studio.data_dir().join("worker.sock");
-    if fs::symlink_metadata(&socket).is_ok() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-            "worker.sock already exists; verify no worker is running before removing a stale socket"));
-    }
     let listener = UnixListener::bind(&socket)?;
-    let _guard = SocketGuard(socket.clone());
+    let _guard = SocketGuard {
+        path: socket.clone(),
+        metadata: fs::symlink_metadata(&socket)?,
+    };
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "Kojora worker PID {} listening at {}",
@@ -436,9 +442,42 @@ pub fn serve_with_checks(
     Ok(())
 }
 
+fn remove_stale_socket(socket: &Path) -> io::Result<()> {
+    let metadata = match verify_private_socket(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match UnixStream::connect(socket) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "an active listener is using worker.sock",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(error) => return Err(error),
+    }
+    let current = verify_private_socket(socket)?;
+    if !same_socket(&metadata, &current) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "worker.sock changed while checking for a stale listener",
+        ));
+    }
+    fs::remove_file(socket)
+}
+
+fn same_socket(original: &fs::Metadata, current: &fs::Metadata) -> bool {
+    current.file_type().is_socket()
+        && current.dev() == original.dev()
+        && current.ino() == original.ino()
+}
+
 /// Only trust a socket file owned by this Unix user in an owner-private
 /// directory, not a symlink or a world-accessible user-supplied endpoint.
-fn verify_private_socket(socket: &Path) -> io::Result<()> {
+fn verify_private_socket(socket: &Path) -> io::Result<fs::Metadata> {
     if !socket.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -465,7 +504,7 @@ fn verify_private_socket(socket: &Path) -> io::Result<()> {
             "worker socket and parent directory must be private and owned by the current user",
         ));
     }
-    Ok(())
+    Ok(metadata)
 }
 
 #[derive(Debug, Clone)]
@@ -1191,11 +1230,92 @@ mod tests {
             verify_private_socket(&socket).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+        assert_eq!(
+            remove_stale_socket(&socket).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&socket).unwrap(), b"fake");
+        fs::remove_file(&socket).unwrap();
+        let target = root.join("target");
+        fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &socket).unwrap();
+        assert_eq!(
+            remove_stale_socket(&socket).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(fs::symlink_metadata(&socket).unwrap().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
         fs::remove_file(&socket).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(verify_private_socket(&socket).is_err());
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_refuses_to_replace_a_live_socket() {
+        let root = test_root();
+        let socket = root.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let error = serve(studio, ProcessLimits::default()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(socket.exists(), "a live socket must remain in place");
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn socket_cleanup_preserves_a_file_that_replaced_the_listener_path() {
+        let root = test_root();
+        let socket = root.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let guard = SocketGuard {
+            path: socket.clone(),
+            metadata: fs::symlink_metadata(&socket).unwrap(),
+        };
+        fs::remove_file(&socket).unwrap();
+        fs::write(&socket, b"keep me").unwrap();
+        drop(guard);
+        assert_eq!(fs::read(&socket).unwrap(), b"keep me");
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_can_restart_with_an_owned_stale_socket() {
+        let root = test_root();
+        let socket = root.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let restarted = thread::spawn(move || serve(studio, ProcessLimits::default()));
+        let mut connected = None;
+        for _ in 0..200 {
+            if let Ok(client) = WorkerClient::connect(&socket) {
+                connected = Some(client);
+                break;
+            }
+            if restarted.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(client) = &connected {
+            client.shutdown().unwrap();
+        } else {
+            assert!(restarted.is_finished(), "Worker never became reachable");
+        }
+        let result = restarted.join().unwrap();
+        let socket_removed = !socket.exists();
+        fs::remove_dir_all(root).unwrap();
+
+        result.unwrap();
+        assert!(connected.is_some());
+        assert!(socket_removed);
     }
 
     #[test]

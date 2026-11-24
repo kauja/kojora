@@ -47,8 +47,8 @@ a running task to stop that specific run.
   This is not a security barrier between applications sharing that user.
 - The Worker holds the state lock; the GUI must not open that same state
   directory in local mode at the same time.
-- A stale worker.sock after a crash must be deleted manually **only after**
-  verifying that the previous Worker is not running.
+- On restart, the Worker holds the Studio lock and replaces an owner-private
+  socket from a previous crash after checking that it has no listener.
 
 ## Resource ceiling semantics
 
