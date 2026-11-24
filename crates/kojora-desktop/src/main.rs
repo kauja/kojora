@@ -9,7 +9,7 @@ use kojora_studio::{
     AgentMode, AgentOutput, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
 use std::borrow::Cow;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
@@ -94,6 +94,48 @@ enum InspectorOutput {
     Diff,
 }
 
+struct CachedAgentOutput {
+    output: io::Result<AgentOutput>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct AgentOutputCache {
+    entries: BTreeMap<u64, CachedAgentOutput>,
+}
+
+impl AgentOutputCache {
+    fn start_frame(&mut self) {
+        self.entries.retain(|_, cached| cached.complete);
+    }
+
+    fn retain_visible(&mut self, tasks: &[&TaskRecord], selected_task: Option<u64>) {
+        self.entries
+            .retain(|id, _| selected_task == Some(*id) || tasks.iter().any(|task| task.id == *id));
+    }
+
+    fn get(
+        &mut self,
+        task_id: u64,
+        status: TaskStatus,
+        read: impl FnOnce() -> io::Result<AgentOutput>,
+    ) -> &io::Result<AgentOutput> {
+        &self
+            .entries
+            .entry(task_id)
+            .or_insert_with(|| {
+                let output = read();
+                let complete = output.is_ok()
+                    && matches!(
+                        status,
+                        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+                    );
+                CachedAgentOutput { output, complete }
+            })
+            .output
+    }
+}
+
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
     worker_startup: Option<WorkerStartup>,
@@ -102,7 +144,7 @@ struct DesktopApp {
     selected_task: Option<u64>,
     inspector_output: InspectorOutput,
     history_page: usize,
-    completed_responses: BTreeMap<u64, String>,
+    agent_outputs: AgentOutputCache,
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
@@ -143,7 +185,7 @@ impl DesktopApp {
             selected_task: None,
             inspector_output: InspectorOutput::default(),
             history_page: 0,
-            completed_responses: BTreeMap::new(),
+            agent_outputs: AgentOutputCache::default(),
             adding_bot: false,
             new_bot_name: String::new(),
             new_workspace: std::env::current_dir()
@@ -400,8 +442,7 @@ impl DesktopApp {
         });
         let end = tasks.len().saturating_sub(self.history_page * 60);
         let page = &tasks[end.saturating_sub(60)..end];
-        self.completed_responses
-            .retain(|id, _| page.iter().any(|task| task.id == *id));
+        self.agent_outputs.retain_visible(page, self.selected_task);
 
         egui::ScrollArea::vertical()
             .id_salt(("conversation", self.history_page))
@@ -435,8 +476,9 @@ impl DesktopApp {
                                     .small(),
                             );
                         }
-                        let response = self.conversation_response(task, bot.provider);
-                        if !response.is_empty() {
+                        if let Ok(AgentOutput::Message(response)) =
+                            self.agent_output(task, bot.provider)
+                        {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(bot.provider.label())
@@ -469,34 +511,17 @@ impl DesktopApp {
             });
     }
 
-    fn conversation_response(
+    fn agent_output(
         &mut self,
         task: &TaskRecord,
         provider: AgentProvider,
-    ) -> Cow<'_, str> {
-        let read = || {
-            self.studio
-                .as_ref()?
+    ) -> &io::Result<AgentOutput> {
+        let studio = self.studio.as_ref();
+        self.agent_outputs.get(task.id, task.status, || {
+            studio
+                .ok_or_else(|| io::Error::other("Studio connection unavailable"))?
                 .read_agent_output(task.id, provider)
-                .ok()
-                .map(|output| match output {
-                    AgentOutput::Message(text) => text,
-                    AgentOutput::Raw(_) => String::new(),
-                })
-        };
-        if matches!(
-            task.status,
-            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
-        ) {
-            return match self.completed_responses.entry(task.id) {
-                Entry::Occupied(response) => Cow::Borrowed(response.into_mut()),
-                Entry::Vacant(slot) => match read() {
-                    Some(response) => Cow::Borrowed(slot.insert(response)),
-                    None => Cow::Borrowed(""),
-                },
-            };
-        }
-        Cow::Owned(read().unwrap_or_default())
+        })
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, state: &StudioState, status: &WorkerStatus) {
@@ -637,20 +662,31 @@ impl DesktopApp {
         });
         ui.separator();
 
-        if let Some(studio) = &self.studio {
+        if let Some(studio) = self.studio.clone() {
             let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
-                studio.check_log(check_id, self.show_stderr)
+                studio
+                    .check_log(check_id, self.show_stderr)
+                    .map(Cow::Owned)
+                    .map_err(|error| error.to_string())
             } else if !self.show_stderr && !self.show_raw_events {
                 let provider = state
                     .bots
                     .iter()
                     .find(|bot| bot.id == task.bot_id)
                     .map_or(AgentProvider::default(), |bot| bot.provider);
-                studio
-                    .read_agent_output(task_id, provider)
-                    .map(AgentOutput::into_text)
+                self.agent_output(task, provider)
+                    .as_ref()
+                    .map(|output| match output {
+                        AgentOutput::Message(text) | AgentOutput::Raw(text) => {
+                            Cow::Borrowed(text.as_str())
+                        }
+                    })
+                    .map_err(io::Error::to_string)
             } else {
-                studio.read_log_tail(task_id, self.show_stderr)
+                studio
+                    .read_log_tail(task_id, self.show_stderr)
+                    .map(Cow::Owned)
+                    .map_err(|error| error.to_string())
             };
             match output_result {
                 Ok(output) => {
@@ -669,7 +705,7 @@ impl DesktopApp {
                         });
                 }
                 Err(error) => {
-                    ui.colored_label(COLOR_ERROR, error.to_string());
+                    ui.colored_label(COLOR_ERROR, error);
                 }
             }
         }
@@ -864,6 +900,7 @@ impl eframe::App for DesktopApp {
         if self.selected_bot.is_none() {
             self.selected_bot = state.bots.first().map(|bot| bot.id);
         }
+        self.agent_outputs.start_frame();
 
         egui::TopBottomPanel::top("top_bar")
             .min_height(68.0)
@@ -1061,8 +1098,38 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn output_reads_are_shared_by_both_panels_and_refresh_for_live_tasks() {
+        let mut cache = AgentOutputCache::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(AgentOutput::Message(format!("read {}", reads.get())))
+        };
+        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
+        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
+        assert_eq!(reads.get(), 1);
+
+        cache.start_frame();
+        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
+        assert_eq!(reads.get(), 2);
+        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
+
+        cache.start_frame();
+        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
+        assert_eq!(reads.get(), 3);
+
+        cache.retain_visible(&[], Some(2));
+        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
+        assert_eq!(reads.get(), 3);
+        cache.retain_visible(&[], None);
+        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
+        assert_eq!(reads.get(), 4);
+    }
 
     #[test]
     fn desktop_can_connect_after_starting_before_the_worker() -> io::Result<()> {
