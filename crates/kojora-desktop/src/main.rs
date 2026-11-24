@@ -13,7 +13,7 @@ use kojora_studio::{
     worker::{StudioConnection, WorkerStatus},
     AgentMode, AgentOutput, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
-use output::{OutputReads, OutputSource};
+use output::{OutputArea, OutputReads, OutputSource};
 use overview::{OverviewRefresh, StudioOverview};
 use std::ffi::OsString;
 use std::io;
@@ -490,7 +490,7 @@ impl DesktopApp {
                             );
                         }
                         if let Some(Ok(AgentOutput::Message(response))) =
-                            self.agent_output(task, bot.provider)
+                            self.agent_output(task, bot.provider, OutputArea::Conversation)
                         {
                             ui.separator();
                             ui.label(
@@ -528,6 +528,7 @@ impl DesktopApp {
         &mut self,
         task: &TaskRecord,
         provider: AgentProvider,
+        area: OutputArea,
     ) -> Option<&io::Result<AgentOutput>> {
         let complete = matches!(
             task.status,
@@ -537,6 +538,7 @@ impl DesktopApp {
             OutputSource::Agent(task.id, provider),
             complete,
             Instant::now(),
+            area,
         )
     }
 
@@ -696,6 +698,7 @@ impl DesktopApp {
                 OutputSource::CheckLog(check_id, self.show_stderr),
                 false,
                 Instant::now(),
+                OutputArea::Inspector,
             )
         } else if !self.show_stderr && !self.show_raw_events {
             let provider = state
@@ -703,12 +706,13 @@ impl DesktopApp {
                 .iter()
                 .find(|bot| bot.id == task.bot_id)
                 .map_or(AgentProvider::default(), |bot| bot.provider);
-            self.agent_output(task, provider)
+            self.agent_output(task, provider, OutputArea::Inspector)
         } else {
             self.outputs.get(
                 OutputSource::TaskLog(task_id, self.show_stderr),
                 false,
                 Instant::now(),
+                OutputArea::Inspector,
             )
         };
         match output_result {
