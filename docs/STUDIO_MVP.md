@@ -51,6 +51,10 @@ The GUI uses the headless `kojora-studio` crate. The state file contains
 prompts and metadata, **not provider credentials**. It is atomically
 replaced and uses Unix mode 0600 inside a mode 0700 directory. An OS file
 lock guards against multiple Studio instances using the same data directory.
+Studio reserves space in the 4 MiB metadata file for each active run to
+finish. When the file has insufficient space, Studio rejects new metadata
+before starting another task. It preserves existing history and can shorten
+oversized run diagnostics to save the terminal status.
 
 The GUI only loads the last 32 KiB of each selected log stream. Logs are
 stored beneath `runs/task-ID/RUN-DIR` in the private data directory. Output
