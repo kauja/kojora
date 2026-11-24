@@ -1,6 +1,7 @@
 //! Kojora Studio: bot-first native desktop user interface.
 //! The headless kojora-studio crate owns storage and execution.
 
+mod output;
 mod overview;
 
 use eframe::egui;
@@ -10,9 +11,8 @@ use kojora_studio::{
     worker::{StudioConnection, WorkerStatus},
     AgentMode, AgentOutput, AgentProvider, StudioState, TaskRecord, TaskStatus,
 };
+use output::{OutputReads, OutputSource};
 use overview::{OverviewRefresh, StudioOverview};
-use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
@@ -97,48 +97,6 @@ enum InspectorOutput {
     Diff,
 }
 
-struct CachedAgentOutput {
-    output: io::Result<AgentOutput>,
-    complete: bool,
-}
-
-#[derive(Default)]
-struct AgentOutputCache {
-    entries: BTreeMap<u64, CachedAgentOutput>,
-}
-
-impl AgentOutputCache {
-    fn start_frame(&mut self) {
-        self.entries.retain(|_, cached| cached.complete);
-    }
-
-    fn retain_visible(&mut self, tasks: &[&TaskRecord], selected_task: Option<u64>) {
-        self.entries
-            .retain(|id, _| selected_task == Some(*id) || tasks.iter().any(|task| task.id == *id));
-    }
-
-    fn get(
-        &mut self,
-        task_id: u64,
-        status: TaskStatus,
-        read: impl FnOnce() -> io::Result<AgentOutput>,
-    ) -> &io::Result<AgentOutput> {
-        &self
-            .entries
-            .entry(task_id)
-            .or_insert_with(|| {
-                let output = read();
-                let complete = output.is_ok()
-                    && matches!(
-                        status,
-                        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
-                    );
-                CachedAgentOutput { output, complete }
-            })
-            .output
-    }
-}
-
 struct DesktopApp {
     studio: Option<Arc<StudioConnection>>,
     overview: OverviewRefresh,
@@ -148,7 +106,7 @@ struct DesktopApp {
     selected_task: Option<u64>,
     inspector_output: InspectorOutput,
     history_page: usize,
-    agent_outputs: AgentOutputCache,
+    outputs: OutputReads,
     adding_bot: bool,
     new_bot_name: String,
     new_workspace: String,
@@ -190,7 +148,7 @@ impl DesktopApp {
             selected_task: None,
             inspector_output: InspectorOutput::default(),
             history_page: 0,
-            agent_outputs: AgentOutputCache::default(),
+            outputs: OutputReads::default(),
             adding_bot: false,
             new_bot_name: String::new(),
             new_workspace: std::env::current_dir()
@@ -452,7 +410,6 @@ impl DesktopApp {
         });
         let end = tasks.len().saturating_sub(self.history_page * 60);
         let page = &tasks[end.saturating_sub(60)..end];
-        self.agent_outputs.retain_visible(page, self.selected_task);
 
         egui::ScrollArea::vertical()
             .id_salt(("conversation", self.history_page))
@@ -486,7 +443,7 @@ impl DesktopApp {
                                     .small(),
                             );
                         }
-                        if let Ok(AgentOutput::Message(response)) =
+                        if let Some(Ok(AgentOutput::Message(response))) =
                             self.agent_output(task, bot.provider)
                         {
                             ui.separator();
@@ -525,13 +482,16 @@ impl DesktopApp {
         &mut self,
         task: &TaskRecord,
         provider: AgentProvider,
-    ) -> &io::Result<AgentOutput> {
-        let studio = self.studio.as_ref();
-        self.agent_outputs.get(task.id, task.status, || {
-            studio
-                .ok_or_else(|| io::Error::other("Studio connection unavailable"))?
-                .read_agent_output(task.id, provider)
-        })
+    ) -> Option<&io::Result<AgentOutput>> {
+        let complete = matches!(
+            task.status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        );
+        self.outputs.get(
+            OutputSource::Agent(task.id, provider),
+            complete,
+            Instant::now(),
+        )
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, view: &StudioOverview) {
@@ -680,51 +640,49 @@ impl DesktopApp {
         });
         ui.separator();
 
-        if let Some(studio) = self.studio.clone() {
-            let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
-                studio
-                    .check_log(check_id, self.show_stderr)
-                    .map(Cow::Owned)
-                    .map_err(|error| error.to_string())
-            } else if !self.show_stderr && !self.show_raw_events {
-                let provider = state
-                    .bots
-                    .iter()
-                    .find(|bot| bot.id == task.bot_id)
-                    .map_or(AgentProvider::default(), |bot| bot.provider);
-                self.agent_output(task, provider)
-                    .as_ref()
-                    .map(|output| match output {
-                        AgentOutput::Message(text) | AgentOutput::Raw(text) => {
-                            Cow::Borrowed(text.as_str())
+        let output_result = if let InspectorOutput::Check(check_id) = self.inspector_output {
+            self.outputs.get(
+                OutputSource::CheckLog(check_id, self.show_stderr),
+                false,
+                Instant::now(),
+            )
+        } else if !self.show_stderr && !self.show_raw_events {
+            let provider = state
+                .bots
+                .iter()
+                .find(|bot| bot.id == task.bot_id)
+                .map_or(AgentProvider::default(), |bot| bot.provider);
+            self.agent_output(task, provider)
+        } else {
+            self.outputs.get(
+                OutputSource::TaskLog(task_id, self.show_stderr),
+                false,
+                Instant::now(),
+            )
+        };
+        match output_result {
+            Some(Ok(AgentOutput::Message(output) | AgentOutput::Raw(output))) => {
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if output.is_empty() {
+                            ui.label(egui::RichText::new("No output yet").weak());
+                        } else {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(output).monospace()).wrap(),
+                            );
                         }
-                    })
-                    .map_err(io::Error::to_string)
-            } else {
-                studio
-                    .read_log_tail(task_id, self.show_stderr)
-                    .map(Cow::Owned)
-                    .map_err(|error| error.to_string())
-            };
-            match output_result {
-                Ok(output) => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("inspector")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if output.is_empty() {
-                                ui.label(egui::RichText::new("No output yet").weak());
-                            } else {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(output).monospace())
-                                        .wrap(),
-                                );
-                            }
-                        });
-                }
-                Err(error) => {
-                    ui.colored_label(COLOR_ERROR, error);
-                }
+                    });
+            }
+            Some(Err(error)) => {
+                ui.colored_label(COLOR_ERROR, error.to_string());
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading output…");
+                });
             }
         }
         ui.add_space(4.0);
@@ -893,6 +851,7 @@ impl eframe::App for DesktopApp {
         let Some(studio) = self.studio.clone() else {
             return;
         };
+        let log_studio = Arc::clone(&studio);
         let overview = self.overview.poll(ctx, Instant::now(), move || {
             let status = studio.status()?;
             let state = studio.snapshot()?;
@@ -931,7 +890,7 @@ impl eframe::App for DesktopApp {
         if self.selected_bot.is_none() {
             self.selected_bot = state.bots.first().map(|bot| bot.id);
         }
-        self.agent_outputs.start_frame();
+        self.outputs.start_frame(Instant::now());
 
         egui::TopBottomPanel::top("top_bar")
             .min_height(68.0)
@@ -990,6 +949,8 @@ impl eframe::App for DesktopApp {
         if self.overview.needs_refresh() {
             ctx.request_repaint();
         }
+        self.outputs
+            .finish_frame(ctx, Instant::now(), move |source| source.read(&log_studio));
     }
 }
 
@@ -1132,38 +1093,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::DirBuilderExt;
-
-    #[test]
-    fn output_reads_are_shared_by_both_panels_and_refresh_for_live_tasks() {
-        let mut cache = AgentOutputCache::default();
-        let reads = Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            Ok(AgentOutput::Message(format!("read {}", reads.get())))
-        };
-        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
-        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
-        assert_eq!(reads.get(), 1);
-
-        cache.start_frame();
-        assert!(cache.get(1, TaskStatus::Running, read).is_ok());
-        assert_eq!(reads.get(), 2);
-        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
-
-        cache.start_frame();
-        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
-        assert_eq!(reads.get(), 3);
-
-        cache.retain_visible(&[], Some(2));
-        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
-        assert_eq!(reads.get(), 3);
-        cache.retain_visible(&[], None);
-        assert!(cache.get(2, TaskStatus::Succeeded, read).is_ok());
-        assert_eq!(reads.get(), 4);
-    }
 
     #[test]
     fn desktop_can_connect_after_starting_before_the_worker() -> io::Result<()> {
