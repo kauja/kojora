@@ -41,7 +41,8 @@ a running task to stop that specific run.
   named local-check enqueue/status/log queries, shutdown.
 - The Worker prepares one worktree diff at a time in the background. It
   still accepts status and cancellation requests, and accepts shutdown after
-  the diff finishes and the rest of the Worker is idle.
+  the diff finishes and the rest of the Worker is idle. The preview has an
+  eight-second deadline for its Git commands, including their subprocesses.
 - IPC callers are trusted processes running as the **same OS user**.
   This is not a security barrier between applications sharing that user.
 - The Worker holds the state lock; the GUI must not open that same state
