@@ -27,6 +27,8 @@ deduplicated across GUI reconnections and Worker restarts. Manual and
 fresh check after completion. Clients explicitly trigger `pre_merge` against
 the current worktree. The Worker observes completed edits before accepting a
 shutdown request and waits for pending checks to finish.
+If a full queue delays an automatic check, the Worker asks for a shutdown
+retry so it can schedule the remaining check first.
 
 ## Allowlisted checks
 
