@@ -483,12 +483,15 @@ impl CheckQueue {
 
     /// Schedule configured hooks for newly completed edit tasks.
     pub fn observe_post_edit(&self, studio: &crate::StudioState) {
+        let _ = self.try_observe_post_edit(studio);
+    }
+
+    /// Report transient queue saturation so shutdown cannot discard an unqueued hook.
+    pub(crate) fn try_observe_post_edit(&self, studio: &crate::StudioState) -> io::Result<()> {
         if self.policy.post_edit.is_empty() {
-            return;
+            return Ok(());
         }
-        let Ok(mut observed) = self.observed_post_edit.lock() else {
-            return;
-        };
+        let mut observed = self.observed_post_edit.lock().map_err(lock_error)?;
         for task in &studio.tasks {
             if task.mode != crate::AgentMode::EditWorktree
                 || task.status != crate::TaskStatus::Succeeded
@@ -515,10 +518,12 @@ impl CheckQueue {
                         // Remember accepted hooks after their history records are evicted.
                         observed.insert(key);
                     }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
                     Err(error) => eprintln!("post-edit check for task {}: {error}", task.id),
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -746,6 +751,34 @@ mod tests {
         (root, policy, worktree)
     }
 
+    fn completed_edit(finished_ms: u64, worktree: PathBuf) -> crate::StudioState {
+        crate::StudioState {
+            next_id: 5,
+            tasks: vec![crate::TaskRecord {
+                id: 1,
+                bot_id: 2,
+                run_id: 3,
+                prompt: "Edit".into(),
+                mode: crate::AgentMode::EditWorktree,
+                status: crate::TaskStatus::Succeeded,
+                created_ms: finished_ms,
+            }],
+            runs: vec![crate::RunRecord {
+                id: 3,
+                task_id: 1,
+                session_id: 4,
+                status: crate::TaskStatus::Succeeded,
+                started_ms: finished_ms,
+                finished_ms: Some(finished_ms),
+                exit_code: Some(0),
+                run_dir: None,
+                worktree_dir: Some(worktree),
+                error: None,
+            }],
+            ..crate::StudioState::default()
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlinked_check_state_without_modifying_target_permissions() {
@@ -906,6 +939,49 @@ mod tests {
     }
 
     #[test]
+    fn observer_reports_queue_saturation_and_retries_the_unqueued_hook() {
+        let (root, mut policy, worktree) = setup();
+        policy.max_pending = 1;
+        policy.post_edit = vec![CheckKind::RustFmt, CheckKind::RustClippy];
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let runner: Arc<CheckRunner> = Arc::new(move |_, _, _, token, _| {
+            while !gate.load(Ordering::Acquire) && !token.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(io::Error::other("fake check result"))
+        });
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        let state = completed_edit(checks.activated_ms, worktree);
+
+        let blocked = checks.try_observe_post_edit(&state);
+        release.store(true, Ordering::Release);
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The original observation remains blocked after the first job exits.
+        assert_eq!(checks.pending_count(), 0);
+        assert_eq!(blocked.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        checks.try_observe_post_edit(&state).unwrap();
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(checks.pending_count(), 0);
+        let records = checks.snapshot().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, CheckKind::RustFmt);
+        assert_eq!(records[1].kind, CheckKind::RustClippy);
+        drop(checks);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn observer_does_not_requeue_a_post_edit_check_after_history_eviction() {
         let (root, policy, worktree) = setup();
         let runner: Arc<CheckRunner> =
@@ -935,28 +1011,7 @@ mod tests {
             journal.next_id = MAX_RECORDS as u64 + 1;
             persist(&checks.root, &journal).unwrap();
         }
-        let mut state = crate::StudioState::default();
-        state.tasks.push(crate::TaskRecord {
-            id: 1,
-            bot_id: 2,
-            run_id: 3,
-            prompt: "test".into(),
-            mode: crate::AgentMode::EditWorktree,
-            status: crate::TaskStatus::Succeeded,
-            created_ms: checks.activated_ms,
-        });
-        state.runs.push(crate::RunRecord {
-            id: 3,
-            task_id: 1,
-            session_id: 4,
-            status: crate::TaskStatus::Succeeded,
-            started_ms: checks.activated_ms,
-            finished_ms: Some(checks.activated_ms),
-            exit_code: Some(0),
-            run_dir: None,
-            worktree_dir: Some(worktree.clone()),
-            error: None,
-        });
+        let state = completed_edit(checks.activated_ms, worktree.clone());
 
         checks.observe_post_edit(&state);
         checks

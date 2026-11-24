@@ -265,7 +265,7 @@ fn dispatch(
                 ));
             }
             if checks.has_post_edit_hooks() {
-                checks.observe_post_edit(&studio.snapshot()?);
+                checks.try_observe_post_edit(&studio.snapshot()?)?;
             }
             if checks.pending_count() != 0 {
                 return Err(io::Error::new(
