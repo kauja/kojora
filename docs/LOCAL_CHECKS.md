@@ -29,6 +29,8 @@ the current worktree. The Worker observes completed edits before accepting a
 shutdown request and waits for pending checks to finish.
 If a full queue delays an automatic check, the Worker asks for a shutdown
 retry so it can schedule the remaining check first.
+The check journal reserves space for pending checks to finish. If a result
+has an oversized diagnostic, it saves the terminal status with a short notice.
 
 ## Allowlisted checks
 
