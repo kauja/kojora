@@ -20,6 +20,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 256;
+// Room for a finished timestamp, terminal status, and a short diagnostic.
+const CHECK_COMPLETION_FIELDS_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -471,7 +473,7 @@ impl CheckQueue {
                 record.error = Some("check worker is unavailable".to_owned());
                 record.finished_ms = Some(now_ms());
             }
-            persist(&self.root, &candidate)?;
+            persist_finished(&self.root, &mut candidate, id)?;
             *journal = candidate;
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -550,7 +552,7 @@ fn execute_job(
                             record.error = Some(format!("check admission failed: {error}"));
                             record.finished_ms = Some(now_ms());
                         }
-                        if persist(root, &proposed).is_ok() {
+                        if persist_finished(root, &mut proposed, job.id).is_ok() {
                             *state = proposed;
                         }
                     }
@@ -628,7 +630,7 @@ fn execute_job(
             record.finished_ms = Some(now_ms());
             record.run_dir = run_dir;
         }
-        if let Err(error) = persist(root, &proposed) {
+        if let Err(error) = persist_finished(root, &mut proposed, job.id) {
             eprintln!("failed to persist completed check #{}: {error}", job.id);
         } else {
             *state = proposed;
@@ -688,14 +690,54 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("check journal lock is poisoned")
 }
 
-fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
+fn encode_journal(root: &Path, journal: &CheckJournal) -> io::Result<Vec<u8>> {
+    let pending = journal
+        .records
+        .iter()
+        .filter(|record| matches!(record.status, CheckStatus::Queued | CheckStatus::Running));
+    let mut budget = MAX_JOURNAL_BYTES as usize;
+    if pending.clone().next().is_some() {
+        // Include the escaped check root and the generated run-directory suffix.
+        let path_bytes = serde_json::to_vec(root).map_err(io::Error::other)?.len() + 96;
+        for record in pending {
+            // The serialized status grows by one byte when it moves to Running.
+            let before_running = usize::from(record.status == CheckStatus::Queued);
+            budget =
+                budget.saturating_sub(CHECK_COMPLETION_FIELDS_BYTES + path_bytes + before_running);
+        }
+    }
     let bytes = serde_json::to_vec(journal).map_err(io::Error::other)?;
-    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+    if bytes.len() > budget {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "check journal size limit",
+            "check journal size limit including pending check reservations",
         ));
     }
+    Ok(bytes)
+}
+
+fn persist_finished(root: &Path, journal: &mut CheckJournal, id: u64) -> io::Result<()> {
+    let bytes = match encode_journal(root, journal) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            if let Some(record) = journal.records.iter_mut().find(|record| record.id == id) {
+                record.run_dir = None;
+                if record.error.is_some() {
+                    record.error = Some("Check error omitted because the journal is full".into());
+                }
+            }
+            encode_journal(root, journal)?
+        }
+        Err(error) => return Err(error),
+    };
+    write_journal(root, &bytes)
+}
+
+fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
+    write_journal(root, &encode_journal(root, journal)?)
+}
+
+fn write_journal(root: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = root.join(format!("checks-{}-{}.tmp", std::process::id(), now_ms()));
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -703,7 +745,7 @@ fn persist(root: &Path, journal: &CheckJournal) -> io::Result<()> {
     opts.mode(0o600);
     let result = (|| -> io::Result<()> {
         let mut file = opts.open(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, root.join("checks.json"))?;
         Ok(())
@@ -977,6 +1019,85 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].kind, CheckKind::RustFmt);
         assert_eq!(records[1].kind, CheckKind::RustClippy);
+        drop(checks);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_check_diagnostic_cannot_keep_the_queue_pending() {
+        let (root, policy, worktree) = setup();
+        let runner: Arc<CheckRunner> =
+            Arc::new(|_, _, _, _, _| Err(io::Error::other("x".repeat(MAX_JOURNAL_BYTES as usize))));
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        let id = checks
+            .enqueue(1, HookPhase::Manual, CheckKind::RustFmt, &worktree)
+            .unwrap();
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let records = checks.snapshot().unwrap();
+        drop(checks);
+        let bytes = fs::read(root.join("checks/checks.json")).unwrap();
+        let persisted: CheckJournal = serde_json::from_slice(&bytes).unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(records[0].id, id);
+        assert_eq!(records[0].status, CheckStatus::Failed);
+        assert_eq!(persisted.records[0].status, CheckStatus::Failed);
+        assert!(persisted.records[0].finished_ms.is_some());
+        assert!(persisted.records[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("journal is full"));
+    }
+
+    #[test]
+    fn near_full_check_journal_refuses_to_enqueue_without_completion_space() {
+        let (root, policy, worktree) = setup();
+        let runner: Arc<CheckRunner> = Arc::new(|_, _, _, _, _| Err(io::Error::other("fixture")));
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        let now = now_ms();
+        let old = CheckRecord {
+            id: 1,
+            task_id: 1,
+            hook: HookPhase::Manual,
+            kind: CheckKind::RustFmt,
+            status: CheckStatus::Failed,
+            created_ms: now,
+            finished_ms: Some(now),
+            run_dir: None,
+            error: None,
+        };
+        let projected = CheckJournal {
+            next_id: 3,
+            records: vec![
+                old.clone(),
+                CheckRecord {
+                    id: 2,
+                    status: CheckStatus::Queued,
+                    finished_ms: None,
+                    ..old.clone()
+                },
+            ],
+        };
+        let remaining = MAX_JOURNAL_BYTES as usize - serde_json::to_vec(&projected).unwrap().len();
+        let mut journal = checks.journal.lock().unwrap();
+        journal.next_id = 2;
+        journal.records.push(CheckRecord {
+            error: Some("x".repeat(remaining - 16)),
+            ..old
+        });
+        persist(&checks.root, &journal).unwrap();
+        drop(journal);
+
+        let result = checks.enqueue(1, HookPhase::Manual, CheckKind::RustFmt, &worktree);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(checks.snapshot().unwrap().len(), 1);
+        assert_eq!(checks.pending_count(), 0);
         drop(checks);
         fs::remove_dir_all(root).unwrap();
     }
