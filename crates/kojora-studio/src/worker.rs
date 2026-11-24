@@ -19,7 +19,8 @@ use std::thread;
 use std::time::Duration;
 
 const VERSION: u32 = 3;
-const MAX_REQUEST: usize = 64 * 1024;
+// A prompt byte may take up to six bytes when JSON escapes a control character.
+const MAX_REQUEST: usize = 6 * crate::MAX_PROMPT_BYTES + 64 * 1024;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024 + 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,6 +1094,43 @@ mod tests {
         server.join().unwrap().unwrap();
         assert!(!socket.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_accepts_a_full_length_prompt_after_json_escaping() {
+        let root = test_root();
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let bot = studio
+            .add_bot("A", root.join("workspace"), root.join("profile"))
+            .unwrap();
+        let socket = root.join("worker.sock");
+        let server = thread::spawn(move || serve(studio, ProcessLimits::default()));
+        let mut connected = None;
+        for _ in 0..200 {
+            if let Ok(client) = WorkerClient::connect(&socket) {
+                connected = Some(client);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let client = connected.unwrap();
+        let prompt = "\u{0001}".repeat(crate::MAX_PROMPT_BYTES);
+        let submitted = client.submit_with_mode(bot, &prompt, AgentMode::Inspect);
+        for _ in 0..200 {
+            if client.status().unwrap().active_count == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = client.snapshot().unwrap();
+        client.shutdown().unwrap();
+        server.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        let task_id = submitted.unwrap();
+        assert_eq!(state.tasks[0].id, task_id);
+        assert_eq!(state.tasks[0].prompt, prompt);
+        assert_eq!(state.tasks[0].status, TaskStatus::Succeeded);
     }
 
     #[test]
