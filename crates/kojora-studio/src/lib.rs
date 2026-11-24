@@ -575,32 +575,36 @@ impl Studio {
     /// Inspect tracked changes and untracked filenames in a completed edit worktree.
     /// Output is bounded in memory; no diff/commit/push side effects.
     pub fn read_worktree_diff(&self, task_id: u64) -> io::Result<String> {
-        let state = self.snapshot()?;
-        let task = state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
-        let run = state
-            .runs
-            .iter()
-            .find(|run| run.id == task.run_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "run not found"))?;
-        let worktree = run.worktree_dir.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no edit worktree for this task")
-        })?;
+        let worktree = {
+            let state = self.state.lock().map_err(lock_error)?;
+            let task = state
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task not found"))?;
+            let run = state
+                .runs
+                .iter()
+                .find(|run| run.id == task.run_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "run not found"))?;
+            run.worktree_dir.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "no edit worktree for this task")
+            })?
+        };
         if !worktree.starts_with(self.root.join("worktrees")) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "invalid worktree path",
             ));
         }
-        let mut result =
-            run_git_limited(worktree, &["status", "--short", "--untracked-files=normal"])?;
+        let mut result = run_git_limited(
+            &worktree,
+            &["status", "--short", "--untracked-files=normal"],
+        )?;
         result.push_str("\n--- Tracked file changes ---\n");
         let remaining = MAX_LOG_TAIL_BYTES.saturating_sub(result.len()).max(1);
         result.push_str(&run_git_limited_with_limit(
-            worktree,
+            &worktree,
             &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
             remaining,
         )?);
@@ -616,7 +620,13 @@ impl Studio {
 
     /// Read only the last 32 KiB of the stdout/stderr log, never the whole log.
     pub fn read_log_tail(&self, task_id: u64, stderr: bool) -> io::Result<String> {
-        let known = self.snapshot()?.tasks.iter().any(|task| task.id == task_id);
+        let known = self
+            .state
+            .lock()
+            .map_err(lock_error)?
+            .tasks
+            .iter()
+            .any(|task| task.id == task_id);
         if !known {
             return Err(io::Error::new(io::ErrorKind::NotFound, "task not found"));
         }
@@ -628,7 +638,7 @@ impl Studio {
             }
             Err(error) => return Err(error),
         };
-        let mut run_dirs = entries
+        let run_dir = entries
             .filter_map(Result::ok)
             .filter_map(|entry| {
                 entry
@@ -637,9 +647,8 @@ impl Studio {
                     .filter(|kind| kind.is_dir())
                     .map(|_| entry.path())
             })
-            .collect::<Vec<_>>();
-        run_dirs.sort_unstable();
-        let Some(run_dir) = run_dirs.last() else {
+            .max();
+        let Some(run_dir) = run_dir else {
             return Ok(String::new());
         };
         let filename = if stderr { "stderr.log" } else { "stdout.log" };

@@ -328,12 +328,17 @@ impl CheckQueue {
 
     /// Return a bounded tail of a check log, never the entire compiler output.
     pub fn read_log_tail(&self, check_id: u64, stderr: bool) -> io::Result<String> {
-        let records = self.snapshot()?;
-        let record = records
+        let run_dir = self
+            .journal
+            .lock()
+            .map_err(lock_error)?
+            .records
             .iter()
             .find(|r| r.id == check_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "check not found"))?;
-        let Some(run_dir) = &record.run_dir else {
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "check not found"))?
+            .run_dir
+            .clone();
+        let Some(run_dir) = run_dir else {
             return Ok(String::new());
         };
         let prefix = self.root.join("runs").join(format!("check-{check_id}"));
