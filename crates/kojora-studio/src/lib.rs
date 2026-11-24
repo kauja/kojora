@@ -21,15 +21,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_LOG_TAIL_BYTES: usize = 32 * 1024;
+const WORKTREE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// This state file only holds metadata and user prompts, never credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,9 +604,12 @@ impl Studio {
                 "invalid worktree path",
             ));
         }
-        let mut result = run_git_limited(
+        let deadline = Instant::now() + WORKTREE_PREVIEW_TIMEOUT;
+        let mut result = run_git_limited_with_limit(
             &worktree,
             &["status", "--short", "--untracked-files=normal"],
+            MAX_LOG_TAIL_BYTES / 2,
+            deadline,
         )?;
         result.push_str("\n--- Tracked file changes ---\n");
         let remaining = MAX_LOG_TAIL_BYTES.saturating_sub(result.len()).max(1);
@@ -607,6 +617,7 @@ impl Studio {
             &worktree,
             &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
             remaining,
+            deadline,
         )?);
         if result.len() > MAX_LOG_TAIL_BYTES {
             let mut boundary = MAX_LOG_TAIL_BYTES;
@@ -742,15 +753,103 @@ fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::
     Ok(destination)
 }
 
-fn run_git_limited(worktree: &Path, args: &[&str]) -> io::Result<String> {
-    run_git_limited_with_limit(worktree, args, MAX_LOG_TAIL_BYTES / 2)
+fn run_git_limited_with_limit(
+    worktree: &Path,
+    args: &[&str],
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<String> {
+    let mut command = git_command(worktree);
+    command.args(args);
+    let mut data = capture_preview(command, limit, deadline)?;
+    let truncated = data.len() > limit;
+    data.truncate(limit);
+    let mut result = String::from_utf8_lossy(&data).into_owned();
+    if truncated {
+        result.push_str("\n[diff output truncated]\n");
+    }
+    Ok(result)
 }
 
-fn run_git_limited_with_limit(worktree: &Path, args: &[&str], limit: usize) -> io::Result<String> {
-    let mut child = git_command(worktree)
-        .args(args)
-        .stdout(Stdio::piped())
+#[cfg(unix)]
+fn preview_time_left(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Git worktree preview timed out"))
+}
+
+#[cfg(unix)]
+fn capture_preview(mut command: Command, limit: usize, deadline: Instant) -> io::Result<Vec<u8>> {
+    preview_time_left(deadline)?;
+    // A socket lets the reader enforce a wall-clock deadline even when Git
+    // or one of its helpers still has stdout open without producing output.
+    let (mut reader, writer) = UnixStream::pair()?;
+    let mut child = command
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .process_group(0)
         .spawn()?;
+    drop(command);
+
+    let mut reaped = false;
+    let output = (|| -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut buffer = [0; 8192];
+        let capacity = limit + 1;
+        while data.len() < capacity {
+            reader.set_read_timeout(Some(preview_time_left(deadline)?))?;
+            let count = (capacity - data.len()).min(buffer.len());
+            match reader.read(&mut buffer[..count]) {
+                Ok(0) => break,
+                Ok(n) => data.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Git worktree preview timed out",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if data.len() <= limit {
+            loop {
+                let remaining = preview_time_left(deadline)?;
+                if let Some(status) = child.try_wait()? {
+                    reaped = true;
+                    return if status.success() {
+                        Ok(data)
+                    } else {
+                        Err(io::Error::other("Git diff/status command failed"))
+                    };
+                }
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+        Ok(data)
+    })();
+
+    // Kill only while we still own an unreaped child. Its process group
+    // includes helpers that may keep the preview output descriptor open.
+    if !reaped {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: the child was started as group leader and has not been reaped.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    output
+}
+
+#[cfg(not(unix))]
+fn capture_preview(mut command: Command, limit: usize, _deadline: Instant) -> io::Result<Vec<u8>> {
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
     let output = (|| -> io::Result<Vec<u8>> {
         let stdout = child
             .stdout
@@ -760,7 +859,7 @@ fn run_git_limited_with_limit(worktree: &Path, args: &[&str], limit: usize) -> i
         stdout.take((limit + 1) as u64).read_to_end(&mut data)?;
         Ok(data)
     })();
-    let mut data = match output {
+    let data = match output {
         Ok(data) => data,
         Err(error) => {
             let _ = child.kill();
@@ -776,12 +875,7 @@ fn run_git_limited_with_limit(worktree: &Path, args: &[&str], limit: usize) -> i
     if !truncated && !status.success() {
         return Err(io::Error::other("Git diff/status command failed"));
     }
-    data.truncate(limit);
-    let mut result = String::from_utf8_lossy(&data).into_owned();
-    if truncated {
-        result.push_str("\n[diff output truncated]\n");
-    }
-    Ok(result)
+    Ok(data)
 }
 
 fn tail_file(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -943,6 +1037,34 @@ mod tests {
                 stderr_bytes: 0,
             })
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_deadline_stops_git_helpers_even_after_the_leader_exits() {
+        let root = temporary_root("preview-deadline");
+        let mut command = Command::new("sh");
+        command
+            .current_dir(&root)
+            .args(["-c", "(sleep 0.5; touch leaked) &"]);
+        let error =
+            capture_preview(command, 32, Instant::now() + Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        thread::sleep(Duration::from_millis(600));
+        assert!(!root.join("leaked").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_deadline_applies_after_stdout_is_closed() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec >&-; sleep 2"]);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(
+            capture_preview(command, 32, deadline).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[test]

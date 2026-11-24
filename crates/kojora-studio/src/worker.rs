@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use crate::checks::{CheckKind, CheckPolicy, CheckQueue, CheckRecord, HookPhase};
-use crate::{AgentMode, AgentProvider, Studio, StudioState, TaskStatus};
+use crate::{AgentMode, AgentProvider, Studio, StudioState, TaskStatus, WORKTREE_PREVIEW_TIMEOUT};
 use kojora_runtime::ProcessLimits;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -104,6 +104,7 @@ fn kind_name(kind: io::ErrorKind) -> &'static str {
         io::ErrorKind::WouldBlock => "busy",
         io::ErrorKind::InvalidInput => "invalid_input",
         io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::TimedOut => "timed_out",
         io::ErrorKind::Unsupported => "unsupported",
         _ => "other",
     }
@@ -115,6 +116,7 @@ fn decode_error(kind: &str, message: String) -> io::Error {
         "busy" => io::ErrorKind::WouldBlock,
         "invalid_input" => io::ErrorKind::InvalidInput,
         "permission_denied" => io::ErrorKind::PermissionDenied,
+        "timed_out" => io::ErrorKind::TimedOut,
         "unsupported" => io::ErrorKind::Unsupported,
         _ => io::ErrorKind::Other,
     };
@@ -497,8 +499,13 @@ impl WorkerClient {
 
     fn request(&self, request: Request) -> io::Result<Response> {
         let mut stream = UnixStream::connect(&self.socket)?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let reply_timeout = if matches!(request, Request::Diff { .. }) {
+            WORKTREE_PREVIEW_TIMEOUT + Duration::from_secs(3)
+        } else {
+            Duration::from_secs(3)
+        };
+        stream.set_read_timeout(Some(reply_timeout))?;
         transmit(&mut stream, &request, MAX_REQUEST)?;
         match receive(&mut stream, MAX_RESPONSE)? {
             Response::Error { kind, message } => Err(decode_error(&kind, message)),
