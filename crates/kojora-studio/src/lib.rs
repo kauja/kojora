@@ -159,13 +159,22 @@ impl Drop for CheckPermit {
     }
 }
 
+struct InstanceLock(File);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // A concurrent fork may still hold the open file description until exec.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 pub struct Studio {
     root: PathBuf,
     state: Arc<Mutex<StudioState>>,
     scheduler: Arc<Mutex<Scheduler>>,
     last_error: Arc<Mutex<Option<String>>>,
     runner: Arc<AgentRunner>,
-    _instance_lock: Arc<File>,
+    _instance_lock: Arc<InstanceLock>,
 }
 
 fn adapter_for(provider: AgentProvider, mode: AgentMode) -> io::Result<&'static dyn AgentAdapter> {
@@ -246,8 +255,9 @@ impl Studio {
         lock_options.read(true).write(true).create(true);
         #[cfg(unix)]
         lock_options.mode(0o600);
-        let lock = Arc::new(lock_options.open(root.join("instance.lock"))?);
+        let lock = lock_options.open(root.join("instance.lock"))?;
         lock.try_lock_exclusive()?;
+        let lock = Arc::new(InstanceLock(lock));
 
         let mut state = read_state(&root)?;
         let mut recovered = false;
@@ -1280,6 +1290,20 @@ mod tests {
         drop(a);
         assert!(Studio::open_with_runner(&root, fake_runner()).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn studio_releases_its_lock_even_if_a_fork_still_holds_a_file_descriptor() {
+        let root = temporary_root("inherited-lock");
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        // A concurrent fork can hold the same open file description until exec.
+        let inherited = studio._instance_lock.0.try_clone().unwrap();
+        drop(studio);
+        let reopened = Studio::open_with_runner(&root, fake_runner());
+        drop(inherited);
+        fs::remove_dir_all(root).unwrap();
+        assert!(reopened.is_ok(), "reopen failed: {:?}", reopened.err());
     }
 
     #[test]
