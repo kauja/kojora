@@ -35,7 +35,8 @@ a running task to stop that specific run.
 - Build the Worker and Desktop from the same revision so their protocol
   versions match.
 - Protocol v3 includes the Bot provider. It uses length-prefixed JSON frames
-  with a 64-KiB request cap and bounded replies.
+  with a 256-KiB request cap to fit JSON-escaped 32-KiB task prompts, and
+  bounded replies.
 - RPC operations: status, snapshot, Bot creation, Task submission, Task
   cancellation, bounded stdout/stderr logs, bounded worktree diff,
   named local-check enqueue/status/log queries, shutdown.
