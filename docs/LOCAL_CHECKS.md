@@ -47,8 +47,12 @@ and *virtual address space*. It refuses arbitrary target directories: only
 the registered, detached Task Worktree may be inspected. A single check
 subprocess runs at once, with bounded pending jobs (default 16),
 wall-clock timeout (default 300 seconds), private stdout/stderr logs
-and atomic check status journaling (`checks/checks.json`). On restart,
-incomplete checks are marked Interrupted rather than blindly resumed.
+and atomic check status journaling (`checks/checks.json`). On Worker restart,
+queued checks resume when their recipe is still enabled, their original
+task worktree can be verified, and startup finds no unfinished agent or
+check that had already started. The journal marks unsafe or unverifiable
+recovery entries Interrupted, including legacy jobs without a saved
+worktree identity.
 On Unix, a queued check also revalidates its worktree before launch and
 records a failure if the directory was moved or replaced.
 

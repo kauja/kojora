@@ -401,12 +401,24 @@ pub fn serve_with_checks(
     let socket = studio.data_dir().join("worker.sock");
     // Studio already holds the exclusive lock for this private directory.
     remove_stale_socket(&socket)?;
+    let listener = UnixListener::bind(&socket)?;
+    let _guard = SocketGuard {
+        path: socket.clone(),
+        metadata: fs::symlink_metadata(&socket)?,
+    };
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let studio = Arc::new(studio);
     let for_checks = Arc::clone(&studio);
-    let checks = CheckQueue::open_with_admission(
+    let recovery_state = if studio.recovered_incomplete_runs {
+        None
+    } else {
+        Some(studio.snapshot()?)
+    };
+    let checks = CheckQueue::open_for_worker(
         studio.data_dir().join("checks"),
         policy,
         Arc::new(move || for_checks.try_acquire_check_slot()),
+        recovery_state.as_ref(),
     )?;
     let running = Arc::new(AtomicBool::new(true));
     let _observer = if checks.has_post_edit_hooks() {
@@ -433,12 +445,6 @@ pub fn serve_with_checks(
             handle: None,
         }
     };
-    let listener = UnixListener::bind(&socket)?;
-    let _guard = SocketGuard {
-        path: socket.clone(),
-        metadata: fs::symlink_metadata(&socket)?,
-    };
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "Kojora worker PID {} listening at {}",
         std::process::id(),
