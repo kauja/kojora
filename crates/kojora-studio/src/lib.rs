@@ -39,6 +39,8 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 // Space for both status changes, terminal fields, and a short diagnostic.
 const RUN_COMPLETION_FIELDS_BYTES: usize = 512;
+// Room for the worktree suffix, device and inode numbers, and creation time.
+const WORKTREE_IDENTITY_FIELDS_BYTES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_LOG_TAIL_BYTES: usize = 32 * 1024;
 const MAX_AGENT_LOG_SCAN_BYTES: usize = 256 * 1024;
@@ -457,6 +459,10 @@ impl Studio {
                 "prompt must contain 1-32768 bytes",
             ));
         }
+        let mut post_edit_checks = match mode {
+            AgentMode::Inspect => None,
+            AgentMode::EditWorktree => PostEditChecks::planned(post_edit_checks),
+        };
         let prepared = (|| -> io::Result<(u64, u64, BotRecord, CancellationToken)> {
             let mut state = self.state.lock().map_err(lock_error)?;
             let mut candidate = state.clone();
@@ -490,7 +496,7 @@ impl Studio {
                 exit_code: None,
                 run_dir: None,
                 worktree_dir: None,
-                post_edit_checks: None,
+                post_edit_checks: post_edit_checks.clone(),
                 error: None,
             });
             let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
@@ -510,7 +516,6 @@ impl Studio {
         let last_error = Arc::clone(&self.last_error);
         let runner = Arc::clone(&self.runner);
         let prompt = prompt.to_owned();
-        let post_edit_checks = post_edit_checks.to_vec();
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
@@ -547,8 +552,9 @@ impl Studio {
                                 &cancellation,
                             )
                             .and_then(|path| {
-                                let post_edit_checks =
-                                    PostEditChecks::capture(&path, post_edit_checks);
+                                if let Some(checks) = &mut post_edit_checks {
+                                    checks.identify_worktree(&path);
+                                }
                                 {
                                     let mut state = shared_state.lock().map_err(lock_error)?;
                                     let mut candidate = state.clone();
@@ -1078,10 +1084,26 @@ fn encode_state(root: &Path, state: &StudioState) -> io::Result<Vec<u8>> {
     if running.clone().next().is_some() {
         // Include the escaped state path plus the suffix of a generated run or worktree directory.
         let path_bytes = serde_json::to_vec(root).map_err(io::Error::other)?.len() + 96;
+        let identity_bytes = if running
+            .clone()
+            .any(|run| run.worktree_dir.is_none() && run.post_edit_checks.is_some())
+        {
+            // The identity uses the canonical path, which can be longer than
+            // the configured state path if an ancestor is a symlink.
+            serde_json::to_vec(&fs::canonicalize(root)?)
+                .map_err(io::Error::other)?
+                .len()
+                + WORKTREE_IDENTITY_FIELDS_BYTES
+        } else {
+            0
+        };
         for run in running {
             budget = budget.saturating_sub(RUN_COMPLETION_FIELDS_BYTES + path_bytes);
             if run.worktree_dir.is_none() {
                 budget = budget.saturating_sub(path_bytes);
+                if run.post_edit_checks.is_some() {
+                    budget = budget.saturating_sub(identity_bytes);
+                }
             }
         }
     }
@@ -1238,8 +1260,7 @@ mod tests {
             post_edit_checks: None,
             error: None,
         });
-        let remaining =
-            MAX_STATE_BYTES as usize - serde_json::to_vec_pretty(&submitted).unwrap().len();
+        let remaining = MAX_STATE_BYTES as usize - serde_json::to_vec(&submitted).unwrap().len();
         // Pad the old metadata so a new Running record fits but its full outcome does not.
         state.runs[0].error = Some("x".repeat(remaining - margin_after_submit));
         state
@@ -1265,6 +1286,51 @@ mod tests {
         assert_eq!(submitted.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(persisted.tasks.len(), 1);
         assert_eq!(persisted.tasks[0].prompt, "Historical task");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_reserves_post_edit_metadata_before_creating_a_worktree() {
+        let fixture = temporary_root("edit-history-budget");
+        let root = fixture.join("state");
+        ensure_private_directory(&root).unwrap();
+        let project = fixture.join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("file.txt"), "initial\n").unwrap();
+        commit_checkout_fixture(&project);
+        let path_bytes = serde_json::to_vec(&root).unwrap().len() + 96;
+        let margin = RUN_COMPLETION_FIELDS_BYTES + 2 * path_bytes + 48;
+        let mut history = history_near_limit(&root, margin);
+        history.bots[0].workspace = project;
+        persist(&root, &history).unwrap();
+
+        let studio = Studio::open_with_runner(&root, fake_runner()).unwrap();
+        let submitted = studio.submit_with_post_edit(
+            1,
+            "Next task",
+            AgentMode::EditWorktree,
+            &[CheckKind::RustFmt],
+        );
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+        let persisted = read_state(&root).unwrap();
+        let orphaned_checkout = root.join("worktrees/task-5").exists();
+        drop(studio);
+        fs::remove_dir_all(fixture).unwrap();
+
+        assert!(
+            submitted.is_err(),
+            "admitted an edit without room for its worktree metadata: {:?}, orphaned checkout: {orphaned_checkout}",
+            persisted.runs.last().and_then(|run| run.error.as_deref())
+        );
+        assert_eq!(submitted.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(persisted.tasks.len(), 1);
+        assert!(!orphaned_checkout);
     }
 
     #[test]
@@ -1488,6 +1554,7 @@ mod tests {
                     Some(&bot.workspace)
                 );
                 assert_eq!(persisted.runs[0].status, TaskStatus::Running);
+                assert!(persisted.runs[0].post_edit_checks.is_some());
                 fs::write(bot.workspace.join("file.txt"), "changed\n")?;
                 let logs = log_root.join("fake-run");
                 fs::create_dir_all(&logs)?;
@@ -1507,7 +1574,12 @@ mod tests {
             .add_bot("Editor", project.clone(), root.join("profile"))
             .unwrap();
         let task = studio
-            .submit_with_mode(id, "Modify file", AgentMode::EditWorktree)
+            .submit_with_post_edit(
+                id,
+                "Modify file",
+                AgentMode::EditWorktree,
+                &[CheckKind::RustFmt],
+            )
             .unwrap();
         for _ in 0..200 {
             if !studio.is_active() {

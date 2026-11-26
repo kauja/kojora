@@ -52,9 +52,10 @@ prompts and metadata, **not provider credentials**. It is atomically
 replaced and uses Unix mode 0600 inside a mode 0700 directory. An OS file
 lock guards against multiple Studio instances using the same data directory.
 Studio reserves space in the 4 MiB metadata file for each active run to
-finish. When the file has insufficient space, Studio rejects new metadata
-before starting another task. It preserves existing history and can shorten
-oversized run diagnostics to save the terminal status.
+finish, including worktree information used by configured post-edit checks.
+When the file has insufficient space, Studio rejects the task before creating
+its worktree or starting the agent. It preserves existing history and can
+shorten oversized run diagnostics to save the terminal status.
 
 The raw log viewer reads the last 32 KiB of the selected stream. The formatted
 assistant view scans up to 256 KiB of stdout for complete events and displays
