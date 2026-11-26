@@ -27,11 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::fd::OwnedFd;
-#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -870,39 +866,37 @@ fn preview_time_left(deadline: Instant) -> io::Result<Duration> {
 
 #[cfg(unix)]
 fn capture_preview(mut command: Command, limit: usize, deadline: Instant) -> io::Result<Vec<u8>> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::io::Errno;
+    use rustix::process::{kill_process_group, Pid, Signal};
+
     preview_time_left(deadline)?;
-    // A socket lets the reader enforce a wall-clock deadline even when Git
-    // or one of its helpers still has stdout open without producing output.
-    let (mut reader, writer) = UnixStream::pair()?;
-    let mut child = command
-        .stdout(Stdio::from(OwnedFd::from(writer)))
-        .process_group(0)
-        .spawn()?;
-    drop(command);
+    let mut child = command.stdout(Stdio::piped()).process_group(0).spawn()?;
 
     let mut reaped = false;
     let output = (|| -> io::Result<Vec<u8>> {
+        let mut reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("no git stdout"))?;
         let mut data = Vec::new();
         let mut buffer = [0; 8192];
         let capacity = limit + 1;
         while data.len() < capacity {
-            reader.set_read_timeout(Some(preview_time_left(deadline)?))?;
+            // A Git helper can hold the pipe open without writing anything.
+            let timeout =
+                Timespec::try_from(preview_time_left(deadline)?).map_err(io::Error::other)?;
+            let mut fds = [PollFd::new(&reader, PollFlags::IN)];
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(0) | Err(Errno::INTR) => continue,
+                Ok(_) => {}
+                Err(error) => return Err(error.into()),
+            }
             let count = (capacity - data.len()).min(buffer.len());
             match reader.read(&mut buffer[..count]) {
                 Ok(0) => break,
                 Ok(n) => data.extend_from_slice(&buffer[..n]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Git worktree preview timed out",
-                    ));
-                }
                 Err(error) => return Err(error),
             }
         }
@@ -926,7 +920,6 @@ fn capture_preview(mut command: Command, limit: usize, deadline: Instant) -> io:
     // Kill only while we still own an unreaped child. Its process group
     // includes helpers that may keep the preview output descriptor open.
     if !reaped {
-        use rustix::process::{kill_process_group, Pid, Signal};
         let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
         let _ = child.kill();
         let _ = child.wait();

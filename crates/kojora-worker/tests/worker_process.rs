@@ -43,10 +43,8 @@ fn worker_process_runs_account_profiles_and_outlives_clients() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root: PathBuf = std::env::temp_dir().join(format!(
-        "kojora-worker-process-{}-{now}",
-        std::process::id()
-    ));
+    // Leave space for the socket name under a long macOS temporary path.
+    let root: PathBuf = std::env::temp_dir().join(format!("kjp-{}-{now:x}", std::process::id()));
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let bin_dir = root.join("bin");

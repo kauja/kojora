@@ -919,8 +919,9 @@ mod tests {
     use std::thread;
 
     fn test_root() -> PathBuf {
+        // Account for long macOS temporary paths and the Unix socket path limit.
         let root = std::env::temp_dir().join(format!(
-            "kojora-worker-test-{}-{}",
+            "kjw-{}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
