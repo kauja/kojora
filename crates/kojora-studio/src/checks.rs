@@ -222,22 +222,24 @@ pub struct PostEditChecks {
 }
 
 impl PostEditChecks {
-    pub(crate) fn capture(path: &Path, kinds: Vec<CheckKind>) -> Option<Self> {
-        if kinds.is_empty() {
-            return None;
-        }
+    pub(crate) fn planned(kinds: &[CheckKind]) -> Option<Self> {
+        (!kinds.is_empty()).then(|| Self {
+            kinds: kinds.to_vec(),
+            identity: None,
+        })
+    }
+
+    pub(crate) fn identify_worktree(&mut self, path: &Path) {
         #[cfg(unix)]
-        let identity = (|| {
-            let path = fs::canonicalize(path).ok()?;
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            WorktreeIdentity::from_metadata(path, metadata)
-        })();
+        {
+            self.identity = (|| {
+                let path = fs::canonicalize(path).ok()?;
+                let metadata = fs::symlink_metadata(&path).ok()?;
+                WorktreeIdentity::from_metadata(path, metadata)
+            })();
+        }
         #[cfg(not(unix))]
-        let identity = {
-            let _ = path;
-            None
-        };
-        Some(Self { kinds, identity })
+        let _ = path;
     }
 }
 
@@ -1643,8 +1645,9 @@ mod tests {
         };
         let first = open(&initial);
         let mut finished = completed_edit(first.activated_ms, worktree.clone());
-        finished.runs[0].post_edit_checks =
-            PostEditChecks::capture(&worktree, policy.post_edit.clone());
+        let mut checks = PostEditChecks::planned(&policy.post_edit).unwrap();
+        checks.identify_worktree(&worktree);
+        finished.runs[0].post_edit_checks = Some(checks);
         drop(first);
 
         let reopened = open(&finished);
@@ -1699,8 +1702,9 @@ mod tests {
         };
         drop(open(&initial));
         let mut finished = completed_edit(now_ms(), worktree.clone());
-        finished.runs[0].post_edit_checks =
-            PostEditChecks::capture(&worktree, policy.post_edit.clone());
+        let mut checks = PostEditChecks::planned(&policy.post_edit).unwrap();
+        checks.identify_worktree(&worktree);
+        finished.runs[0].post_edit_checks = Some(checks);
         fs::rename(&worktree, root.join("original-checkout")).unwrap();
         fs::create_dir(&worktree).unwrap();
 
