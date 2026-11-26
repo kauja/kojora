@@ -103,7 +103,8 @@ controller. Default workspace builds exclude the GUI.
   that share the agent process group. A successful cancellation is stored as
   `Cancelled` (distinct from `Failed` and crash-recovery `Interrupted`).
   The `events.jsonl` journal records `"cancelled": true` for a stopped
-  process. The same API works for read-only and opt-in worktree edit runs.
+  process. For opt-in edits, the same cancellation also stops Git and its
+  subprocesses in the checkout process group during worktree preparation.
 - Cancellation is **not a secure sandbox or guaranteed full machine process
   cleanup**: detached/daemonized descendants that created their own OS
   process group may survive, and abruptly closing or killing Studio itself
