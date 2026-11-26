@@ -811,7 +811,8 @@ fn create_detached_worktree(
             "Bot workspace must be the root of its Git checkout",
         ));
     }
-    if root.starts_with(&workspace) || workspace.starts_with(root) {
+    let state_root = fs::canonicalize(root)?;
+    if state_root.starts_with(&workspace) || workspace.starts_with(&state_root) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Studio state and Git checkout must be separate",
@@ -1610,6 +1611,46 @@ mod tests {
             .arg(worktree)
             .status();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_rejects_state_inside_the_checkout_through_a_symlinked_parent() {
+        let fixture = temporary_root("worktree-overlap");
+        let project = fixture.join("checkout");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("file.txt"), "initial\n").unwrap();
+        commit_checkout_fixture(&project);
+        let alias = fixture.join("alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let studio_root = alias.join("state");
+        let studio = Studio::open_with_runner(&studio_root, fake_runner()).unwrap();
+        let bot = studio
+            .add_bot("Editor", project.clone(), fixture.join("profile"))
+            .unwrap();
+        studio
+            .submit_with_mode(bot, "Modify file", AgentMode::EditWorktree)
+            .unwrap();
+        for _ in 0..200 {
+            if !studio.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!studio.is_active());
+
+        let state = read_state(&studio_root).unwrap();
+        let worktrees_created = studio_root.join("worktrees").exists();
+        drop(studio);
+        fs::remove_dir_all(fixture).unwrap();
+
+        assert_eq!(state.tasks[0].status, TaskStatus::Failed);
+        assert_eq!(
+            state.runs[0].error.as_deref(),
+            Some("Studio state and Git checkout must be separate")
+        );
+        assert!(state.runs[0].worktree_dir.is_none());
+        assert!(!worktrees_created);
     }
 
     #[cfg(unix)]
