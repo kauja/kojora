@@ -198,6 +198,8 @@ pub struct Studio {
     scheduler: Arc<Mutex<Scheduler>>,
     last_error: Arc<Mutex<Option<String>>>,
     runner: Arc<AgentRunner>,
+    #[cfg(unix)]
+    recovered_incomplete_runs: bool,
     _instance_lock: Arc<InstanceLock>,
 }
 
@@ -308,6 +310,8 @@ impl Studio {
             scheduler: Arc::new(Mutex::new(scheduler)),
             last_error: Arc::new(Mutex::new(None)),
             runner,
+            #[cfg(unix)]
+            recovered_incomplete_runs: recovered,
             _instance_lock: lock,
         })
     }

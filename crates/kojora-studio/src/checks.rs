@@ -5,7 +5,7 @@ use kojora_runtime::{
     CancellationToken, IsolatedExecutor, LocalExecutor, ProcessLimits, RunOutcome, RunSpec,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -93,6 +93,8 @@ pub struct CheckRecord {
 struct CheckJournal {
     next_id: u64,
     records: Vec<CheckRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    queued_worktrees: BTreeMap<u64, WorktreeIdentity>,
 }
 
 impl Default for CheckJournal {
@@ -100,6 +102,7 @@ impl Default for CheckJournal {
         Self {
             next_id: 1,
             records: Vec::new(),
+            queued_worktrees: BTreeMap::new(),
         }
     }
 }
@@ -185,7 +188,42 @@ struct Job {
     token: CancellationToken,
 }
 
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Debug)]
+struct WorktreeIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    created: SystemTime,
+}
+
 impl Job {
+    fn open(id: u64, workspace: PathBuf) -> io::Result<Self> {
+        let job = Self {
+            id,
+            #[cfg(unix)]
+            opened_workspace: File::open(&workspace)?,
+            workspace,
+            token: CancellationToken::default(),
+        };
+        job.verify_workspace()?;
+        Ok(job)
+    }
+
+    fn identity(&self) -> Option<WorktreeIdentity> {
+        #[cfg(unix)]
+        {
+            let metadata = self.opened_workspace.metadata().ok()?;
+            Some(WorktreeIdentity {
+                path: self.workspace.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                created: metadata.created().ok()?,
+            })
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
     fn verify_workspace(&self) -> io::Result<()> {
         let metadata = fs::symlink_metadata(&self.workspace).map_err(|error| {
             io::Error::new(
@@ -211,6 +249,46 @@ impl Job {
         }
         Ok(())
     }
+}
+
+fn validate_worktree(root: &Path, task_id: u64, workspace: &Path) -> io::Result<PathBuf> {
+    let worktrees = root
+        .parent()
+        .ok_or_else(|| io::Error::other("check root has no parent"))?
+        .join("worktrees");
+    let expected = worktrees.join(format!("task-{task_id}"));
+    let actual = fs::canonicalize(workspace)?;
+    if !fs::symlink_metadata(&worktrees)?.file_type().is_dir()
+        || !fs::symlink_metadata(&expected)?.file_type().is_dir()
+        || fs::canonicalize(&expected)? != actual
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "check must use the task's own detached Git worktree",
+        ));
+    }
+    Ok(actual)
+}
+
+fn restore_queued_job(
+    root: &Path,
+    record: &CheckRecord,
+    identity: &WorktreeIdentity,
+    state: Option<&crate::StudioState>,
+) -> Option<Job> {
+    let state = state?;
+    let task = state.tasks.iter().find(|task| {
+        task.id == record.task_id
+            && task.mode == crate::AgentMode::EditWorktree
+            && task.status != crate::TaskStatus::Running
+    })?;
+    let run = state
+        .runs
+        .iter()
+        .find(|run| run.id == task.run_id && run.task_id == task.id)?;
+    let workspace = validate_worktree(root, task.id, run.worktree_dir.as_deref()?).ok()?;
+    let job = Job::open(record.id, workspace).ok()?;
+    (job.identity().as_ref()? == identity).then_some(job)
 }
 
 #[derive(Clone)]
@@ -240,6 +318,23 @@ impl CheckQueue {
             policy,
             Arc::new(execute_builtin),
             Some(admission),
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_for_worker(
+        root: impl Into<PathBuf>,
+        policy: CheckPolicy,
+        admission: Arc<CheckAdmission>,
+        state: Option<&crate::StudioState>,
+    ) -> io::Result<Self> {
+        Self::open_with_runner_and_admission(
+            root,
+            policy,
+            Arc::new(execute_builtin),
+            Some(admission),
+            state,
         )
     }
 
@@ -248,7 +343,7 @@ impl CheckQueue {
         policy: CheckPolicy,
         runner: Arc<CheckRunner>,
     ) -> io::Result<Self> {
-        Self::open_with_runner_and_admission(root, policy, runner, None)
+        Self::open_with_runner_and_admission(root, policy, runner, None, None)
     }
 
     fn open_with_runner_and_admission(
@@ -256,6 +351,7 @@ impl CheckQueue {
         policy: CheckPolicy,
         runner: Arc<CheckRunner>,
         admission: Option<Arc<CheckAdmission>>,
+        recovery_state: Option<&crate::StudioState>,
     ) -> io::Result<Self> {
         policy.validate()?;
         let root = root.into();
@@ -316,14 +412,39 @@ impl CheckQueue {
             Err(error) if error.kind() == io::ErrorKind::NotFound => CheckJournal::default(),
             Err(error) => return Err(error),
         };
-        let mut recovered = false;
+        // A previously started check could still be alive after a Worker crash.
+        let recovery_state = recovery_state.filter(|_| {
+            !journal
+                .records
+                .iter()
+                .any(|record| record.status == CheckStatus::Running)
+        });
+        let mut identities = std::mem::take(&mut journal.queued_worktrees);
+        let mut recovered = !identities.is_empty();
+        let mut ready = Vec::new();
         for record in &mut journal.records {
-            if matches!(record.status, CheckStatus::Queued | CheckStatus::Running) {
-                record.status = CheckStatus::Interrupted;
-                record.error = Some("Worker restarted before check finished".into());
-                record.finished_ms = Some(now_ms());
-                recovered = true;
+            if record.status == CheckStatus::Queued
+                && policy.permits(record.hook, record.kind)
+                && ready.len() < policy.max_pending
+            {
+                if let Some(identity) = identities.remove(&record.id) {
+                    if let Some(job) = restore_queued_job(&root, record, &identity, recovery_state)
+                    {
+                        journal.queued_worktrees.insert(record.id, identity);
+                        ready.push(job);
+                        continue;
+                    }
+                }
             }
+            let reason = match record.status {
+                CheckStatus::Queued => "Queued check could not be verified after restart",
+                CheckStatus::Running => "Worker restarted before check finished",
+                _ => continue,
+            };
+            record.status = CheckStatus::Interrupted;
+            record.error = Some(reason.into());
+            record.finished_ms = Some(now_ms());
+            recovered = true;
         }
         if recovered {
             persist(&root, &journal)?;
@@ -331,6 +452,11 @@ impl CheckQueue {
         let journal = Arc::new(Mutex::new(journal));
         let activated_ms = now_ms();
         let (sender, receiver) = mpsc::channel::<Job>();
+        for job in ready {
+            sender
+                .send(job)
+                .map_err(|_| io::Error::other("check queue is unavailable"))?;
+        }
         let shared = Arc::clone(&journal);
         let worker_root = root.clone();
         let worker_policy = policy.clone();
@@ -421,22 +547,7 @@ impl CheckQueue {
                 "check is not enabled for this hook",
             ));
         }
-        let worktrees = self
-            .root
-            .parent()
-            .ok_or_else(|| io::Error::other("check root has no parent"))?
-            .join("worktrees");
-        let expected = worktrees.join(format!("task-{task_id}"));
-        let actual = fs::canonicalize(workspace)?;
-        if !fs::symlink_metadata(&worktrees)?.file_type().is_dir()
-            || !fs::symlink_metadata(&expected)?.file_type().is_dir()
-            || fs::canonicalize(&expected)? != actual
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "check must use the task's own detached Git worktree",
-            ));
-        }
+        let actual = validate_worktree(&self.root, task_id, workspace)?;
         let mut journal = self.journal.lock().map_err(lock_error)?;
         if let Some(existing) = journal.records.iter().find(|record| {
             record.task_id == task_id
@@ -475,14 +586,10 @@ impl CheckQueue {
             }
         }
         let id = proposed.next_id;
-        let job = Job {
-            id,
-            #[cfg(unix)]
-            opened_workspace: File::open(&actual)?,
-            workspace: actual,
-            token: CancellationToken::default(),
-        };
-        job.verify_workspace()?;
+        let job = Job::open(id, actual)?;
+        if let Some(identity) = job.identity() {
+            proposed.queued_worktrees.insert(id, identity);
+        }
         proposed.next_id = id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("check ID exhausted"))?;
@@ -501,6 +608,7 @@ impl CheckQueue {
         *journal = proposed;
         if self.sender.send(job).is_err() {
             let mut candidate = journal.clone();
+            candidate.queued_worktrees.remove(&id);
             if let Some(record) = candidate.records.iter_mut().find(|r| r.id == id) {
                 record.status = CheckStatus::Interrupted;
                 record.error = Some("check worker is unavailable".to_owned());
@@ -580,6 +688,7 @@ fn execute_job(
                 Err(error) => {
                     if let Ok(mut state) = shared.lock() {
                         let mut proposed = state.clone();
+                        proposed.queued_worktrees.remove(&job.id);
                         if let Some(record) = proposed.records.iter_mut().find(|r| r.id == job.id) {
                             record.status = CheckStatus::Failed;
                             record.error = Some(format!("check admission failed: {error}"));
@@ -608,6 +717,7 @@ fn execute_job(
     }
     let kind = record.kind;
     let mut proposed = guard.clone();
+    let was_recoverable = proposed.queued_worktrees.remove(&job.id).is_some();
     if let Some(record) = proposed.records.iter_mut().find(|r| r.id == job.id) {
         record.status = CheckStatus::Running;
     }
@@ -633,9 +743,14 @@ fn execute_job(
         }
     });
     let log_root = root.join("runs").join(format!("check-{}", job.id));
-    let outcome = job
-        .verify_workspace()
-        .and_then(|()| runner(&job.workspace, &log_root, kind, token, policy));
+    // Make the Running transition durable before allowing replayable checks to execute.
+    let outcome = if was_recoverable {
+        File::open(root).and_then(|dir| dir.sync_all())
+    } else {
+        Ok(())
+    }
+    .and_then(|()| job.verify_workspace())
+    .and_then(|()| runner(&job.workspace, &log_root, kind, token, policy));
     drop(done_tx);
     let _ = watcher.join();
 
@@ -1118,6 +1233,7 @@ mod tests {
                     ..old.clone()
                 },
             ],
+            ..CheckJournal::default()
         };
         let remaining = MAX_JOURNAL_BYTES as usize - serde_json::to_vec(&projected).unwrap().len();
         let mut journal = checks.journal.lock().unwrap();
@@ -1186,6 +1302,117 @@ mod tests {
         let rejected = records.iter().find(|record| record.id == queued).unwrap();
         assert_eq!(rejected.status, CheckStatus::Failed);
         assert!(rejected.error.as_deref().unwrap().contains("worktree"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_resumes_only_verified_queued_checks_with_enabled_recipes() {
+        let (root, policy, worktree) = setup();
+        let checks_root = root.join("checks");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&checks_root)
+            .unwrap();
+        let job = Job::open(1, fs::canonicalize(&worktree).unwrap()).unwrap();
+        let Some(identity) = job.identity() else {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        };
+        let mut replaced_identity = identity.clone();
+        replaced_identity.inode ^= 1;
+        let queued = CheckRecord {
+            id: 1,
+            task_id: 1,
+            hook: HookPhase::Manual,
+            kind: CheckKind::RustFmt,
+            status: CheckStatus::Queued,
+            created_ms: now_ms(),
+            finished_ms: None,
+            run_dir: None,
+            error: None,
+        };
+        let journal = CheckJournal {
+            next_id: 6,
+            records: vec![
+                queued.clone(),
+                CheckRecord {
+                    id: 2,
+                    status: CheckStatus::Succeeded,
+                    ..queued.clone()
+                },
+                CheckRecord {
+                    id: 3,
+                    ..queued.clone()
+                },
+                CheckRecord {
+                    id: 4,
+                    ..queued.clone()
+                },
+                CheckRecord {
+                    id: 5,
+                    hook: HookPhase::PreMerge,
+                    ..queued
+                },
+            ],
+            queued_worktrees: BTreeMap::from([
+                (1, identity.clone()),
+                (4, replaced_identity),
+                (5, identity),
+            ]),
+        };
+        persist(&checks_root, &journal).unwrap();
+        let state = completed_edit(now_ms(), worktree);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let runner: Arc<CheckRunner> = Arc::new(move |_, _, _, _, _| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::other("fixture ran"))
+        });
+        let queue = CheckQueue::open_with_runner_and_admission(
+            &checks_root,
+            policy.clone(),
+            Arc::clone(&runner),
+            None,
+            Some(&state),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            if queue.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let records = queue.snapshot().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(records[0].id, 1);
+        assert_eq!(records[0].error.as_deref(), Some("fixture ran"));
+        assert_eq!(records[1].status, CheckStatus::Succeeded);
+        assert!(records[2..]
+            .iter()
+            .all(|record| record.status == CheckStatus::Interrupted));
+        assert!(queue.journal.lock().unwrap().queued_worktrees.is_empty());
+        drop(queue);
+
+        let mut ambiguous = journal;
+        ambiguous.records[1].status = CheckStatus::Running;
+        persist(&checks_root, &ambiguous).unwrap();
+        let restarted = CheckQueue::open_with_runner_and_admission(
+            &checks_root,
+            policy,
+            runner,
+            None,
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(restarted.pending_count(), 0);
+        assert!(restarted
+            .snapshot()
+            .unwrap()
+            .iter()
+            .all(|record| record.status == CheckStatus::Interrupted));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1292,6 +1519,7 @@ mod tests {
             policy,
             check_runner,
             Some(Arc::new(move || for_checks.try_acquire_check_slot())),
+            None,
         )
         .unwrap();
         checks
