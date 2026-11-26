@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// The capabilities of the *adapter*, not the enclosing runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +428,17 @@ impl ProfileLease {
 
 impl Drop for ProfileLease {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let (Ok(acquired), Ok(current)) =
+                (self._lock.metadata(), fs::symlink_metadata(&self.path))
+            else {
+                return;
+            };
+            if current.dev() != acquired.dev() || current.ino() != acquired.ino() {
+                return;
+            }
+        }
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -634,6 +645,23 @@ mod tests {
         drop(first);
         assert!(ProfileLease::acquire(&profile).is_ok());
         fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn finishing_an_old_lease_does_not_remove_a_replacement() {
+        let profile = test_profile("replacement-lease");
+        let path = profile.join(".kojora-agent.lock");
+        let first = ProfileLease::acquire(&profile).unwrap();
+        fs::rename(&path, profile.join("old.lock")).unwrap();
+        let replacement = ProfileLease::acquire(&profile).unwrap();
+        drop(first);
+
+        let third_error = ProfileLease::acquire(&profile)
+            .err()
+            .map(|error| error.kind());
+        drop(replacement);
+        fs::remove_dir_all(profile).unwrap();
+        assert_eq!(third_error, Some(io::ErrorKind::AlreadyExists));
     }
 
     #[test]
