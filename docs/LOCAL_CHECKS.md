@@ -53,6 +53,10 @@ task worktree can be verified, and startup finds no unfinished agent or
 check that had already started. The journal marks unsafe or unverifiable
 recovery entries Interrupted, including legacy jobs without a saved
 worktree identity.
+The Worker also picks up successful edits that were saved just before a
+restart and had yet to be queued. It resumes the recipes selected for the
+original run and still enabled at startup, with the same worktree identity
+and the same recovery conditions as queued checks.
 On Unix, a queued check also revalidates its worktree before launch and
 records a failure if the directory was moved or replaced.
 

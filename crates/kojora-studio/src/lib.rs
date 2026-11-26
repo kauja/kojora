@@ -6,6 +6,7 @@ pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
 
+use checks::{CheckKind, PostEditChecks};
 use scheduler::{AdmissionPolicy, Scheduler};
 
 use fs2::FileExt;
@@ -139,6 +140,8 @@ pub struct RunRecord {
     pub run_dir: Option<PathBuf>,
     #[serde(default)]
     pub worktree_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_edit_checks: Option<PostEditChecks>,
     pub error: Option<String>,
 }
 
@@ -438,6 +441,16 @@ impl Studio {
 
     /// Opt-in edit runs get a detached Git worktree under Studio's private state root.
     pub fn submit_with_mode(&self, bot_id: u64, prompt: &str, mode: AgentMode) -> io::Result<u64> {
+        self.submit_with_post_edit(bot_id, prompt, mode, &[])
+    }
+
+    fn submit_with_post_edit(
+        &self,
+        bot_id: u64,
+        prompt: &str,
+        mode: AgentMode,
+        post_edit_checks: &[CheckKind],
+    ) -> io::Result<u64> {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -477,6 +490,7 @@ impl Studio {
                 exit_code: None,
                 run_dir: None,
                 worktree_dir: None,
+                post_edit_checks: None,
                 error: None,
             });
             let mut scheduler = self.scheduler.lock().map_err(lock_error)?;
@@ -496,6 +510,7 @@ impl Studio {
         let last_error = Arc::clone(&self.last_error);
         let runner = Arc::clone(&self.runner);
         let prompt = prompt.to_owned();
+        let post_edit_checks = post_edit_checks.to_vec();
         let spawn = thread::Builder::new()
             .name(format!("kojora-task-{task_id}"))
             .spawn(move || {
@@ -532,6 +547,8 @@ impl Studio {
                                 &cancellation,
                             )
                             .and_then(|path| {
+                                let post_edit_checks =
+                                    PostEditChecks::capture(&path, post_edit_checks);
                                 {
                                     let mut state = shared_state.lock().map_err(lock_error)?;
                                     let mut candidate = state.clone();
@@ -543,6 +560,7 @@ impl Studio {
                                             io::Error::new(io::ErrorKind::NotFound, "run not found")
                                         })?;
                                     run.worktree_dir = Some(path.clone());
+                                    run.post_edit_checks = post_edit_checks;
                                     commit_state(&root, &mut state, candidate)?;
                                 }
                                 if cancellation.is_cancelled() {
@@ -1195,6 +1213,7 @@ mod tests {
             exit_code: Some(1),
             run_dir: None,
             worktree_dir: None,
+            post_edit_checks: None,
             error: None,
         });
         let mut submitted = state.clone();
@@ -1218,6 +1237,7 @@ mod tests {
             exit_code: None,
             run_dir: None,
             worktree_dir: None,
+            post_edit_checks: None,
             error: None,
         });
         let remaining =
@@ -1392,6 +1412,7 @@ mod tests {
             exit_code: None,
             run_dir: None,
             worktree_dir: None,
+            post_edit_checks: None,
             error: None,
         });
         // Legacy Studio allowed a Running state to fill the entire metadata file.
