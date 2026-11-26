@@ -918,10 +918,8 @@ fn capture_preview(mut command: Command, limit: usize, deadline: Instant) -> io:
     // Kill only while we still own an unreaped child. Its process group
     // includes helpers that may keep the preview output descriptor open.
     if !reaped {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: the child was started as group leader and has not been reaped.
-            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
+        use rustix::process::{kill_process_group, Pid, Signal};
+        let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
         let _ = child.kill();
         let _ = child.wait();
     }

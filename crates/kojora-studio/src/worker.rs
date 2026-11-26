@@ -513,8 +513,7 @@ fn verify_private_socket(socket: &Path) -> io::Result<fs::Metadata> {
     })?;
     let directory = fs::symlink_metadata(parent)?;
     let metadata = fs::symlink_metadata(socket)?;
-    // SAFETY: libc::geteuid queries only the effective Unix user ID.
-    let uid = unsafe { libc::geteuid() };
+    let uid = rustix::process::geteuid().as_raw();
     if !directory.is_dir()
         || directory.file_type().is_symlink()
         || directory.uid() != uid

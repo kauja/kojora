@@ -27,7 +27,7 @@ license = "MIT"
 repository = "https://github.com/kauja/kojora"
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+unsafe_code = "forbid"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
@@ -35,6 +35,5 @@ dbg_macro = "deny"
 expect_used = "deny"
 panic = "deny"
 todo = "deny"
-undocumented_unsafe_blocks = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"

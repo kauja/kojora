@@ -22,8 +22,9 @@ crate dependencies before running Rustfmt, tests and Clippy. See
 entry point and regression coverage for each feature.
 
 CI uses the Rust version in `rust-toolchain.toml` and the committed
-`Cargo.lock`. Workspace lints reject panicking shortcuts in production code,
-unfinished implementations, debugging macros and undocumented unsafe blocks.
+`Cargo.lock`. The compiler forbids `unsafe` throughout the Rust workspace,
+including tests. Other workspace lints reject panicking shortcuts in
+production code, unfinished implementations and debugging macros.
 A test fixture may use assertions or unwrap a result to fail immediately.
 
 Use a credential-free runner or fixture to exercise a provider change.

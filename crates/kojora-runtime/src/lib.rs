@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use rustix::process::{kill_process_group, Pid, Signal};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -77,19 +79,30 @@ impl ProcessLimits {
                 "resource limits must be positive",
             ));
         }
+        #[cfg(not(unix))]
+        if self.address_space_mib.is_some() || self.cpu_seconds.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process limits require Unix",
+            ));
+        }
+        // Reject values that would become the kernel's unlimited sentinel
+        // or fall outside the platform's resource-limit representation.
+        #[cfg(unix)]
         if let Some(mib) = self.address_space_mib {
             let bytes = mib.checked_mul(1024 * 1024).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflow")
             })?;
-            if u128::from(bytes) > u128::from(libc::rlim_t::MAX) {
+            if u128::from(bytes) >= u128::from(libc::RLIM_INFINITY) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "memory limit too large",
                 ));
             }
         }
+        #[cfg(unix)]
         if let Some(seconds) = self.cpu_seconds {
-            if u128::from(seconds) > u128::from(libc::rlim_t::MAX) {
+            if u128::from(seconds) >= u128::from(libc::RLIM_INFINITY) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "CPU limit too large",
@@ -200,13 +213,14 @@ impl LocalExecutor {
             command.process_group(0);
         }
         #[cfg(unix)]
-        if limits.address_space_mib.is_some() || limits.cpu_seconds.is_some() {
-            // SAFETY: pre_exec only calls async-signal-safe setrlimit syscall(s).
-            // No allocations, mutexes or Rust runtimes are touched in child.
-            unsafe {
-                command.pre_exec(move || apply_process_limits(limits));
-            }
-        }
+        rune_rlimits::apply(
+            &mut command,
+            &rune_rlimits::Limits {
+                memory_mb: limits.address_space_mib,
+                cpu_seconds: limits.cpu_seconds,
+                ..Default::default()
+            },
+        );
         if let Some(variables) = environment {
             command.env_clear();
             command.envs(variables.iter().cloned());
@@ -253,7 +267,7 @@ impl LocalExecutor {
                 // Never abandon a live child or an undrained pipe on wait errors.
                 #[cfg(unix)]
                 if cancellation.is_some() {
-                    let _ = signal_group(child.id(), libc::SIGKILL);
+                    let _ = signal_group(&child, Signal::KILL);
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -328,32 +342,6 @@ impl IsolatedExecutor for LocalExecutor {
     }
 }
 
-#[cfg(unix)]
-fn apply_process_limits(limits: ProcessLimits) -> io::Result<()> {
-    if let Some(mib) = limits.address_space_mib {
-        let bytes = mib * 1024 * 1024;
-        let ceiling = libc::rlimit {
-            rlim_cur: bytes as libc::rlim_t,
-            rlim_max: bytes as libc::rlim_t,
-        };
-        // SAFETY: primitive numeric values only; called in pre_exec after fork.
-        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &ceiling) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if let Some(seconds) = limits.cpu_seconds {
-        let ceiling = libc::rlimit {
-            rlim_cur: seconds as libc::rlim_t,
-            rlim_max: seconds as libc::rlim_t,
-        };
-        // SAFETY: primitive numeric values only; called in pre_exec after fork.
-        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &ceiling) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 /// Wait without blocking cancellation. On Unix, the child is started in its
 /// own process group. TERM offers a brief cleanup window; KILL then ensures
 /// children that ignore TERM cannot keep stdout/stderr pipes open.
@@ -372,9 +360,9 @@ fn wait_child(
                 // Do not reap the leader between TERM and KILL: its PID cannot
                 // be reused while the zombie remains un-waited, avoiding
                 // accidentally signalling a different process group.
-                signal_group(child.id(), libc::SIGTERM)?;
+                signal_group(child, Signal::TERM)?;
                 thread::sleep(Duration::from_millis(200));
-                signal_group(child.id(), libc::SIGKILL)?;
+                signal_group(child, Signal::KILL)?;
             }
             #[cfg(not(unix))]
             {
@@ -396,19 +384,37 @@ fn wait_child(
 }
 
 #[cfg(unix)]
-fn signal_group(child_pid: u32, signal: libc::c_int) -> io::Result<()> {
-    let pid = i32::try_from(child_pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child PID"))?;
-    // SAFETY: negative PID targets the dedicated process group created by
-    // CommandExt::process_group(0); no shell or arbitrary PID is accepted.
-    let result = unsafe { libc::kill(-pid, signal) };
-    if result == -1 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
+fn signal_group(child: &Child, signal: Signal) -> io::Result<()> {
+    let group = Pid::from_child(child);
+    match kill_process_group(group, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM) if macos_group_has_no_live_process(group) => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_has_no_live_process(group: Pid) -> bool {
+    // Darwin can return EPERM if only zombies remain in a process group.
+    // Check every member while the unreaped child still reserves the group ID.
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "state="])
+        .env_clear()
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && !output.stdout.is_empty()
+        && String::from_utf8_lossy(&output.stdout).lines().all(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let id = fields.next().and_then(|value| value.parse::<i32>().ok());
+            match (id, fields.next()) {
+                (Some(id), Some(state)) => id != group.as_raw_pid() || state.starts_with('Z'),
+                _ => false,
+            }
+        })
 }
 
 /// Fixed-size buffers keep log capture independent of total output volume.
@@ -681,6 +687,12 @@ mod tests {
         .validate()
         .is_err());
         assert!(ProcessLimits {
+            address_space_mib: None,
+            cpu_seconds: Some(u64::MAX),
+        }
+        .validate()
+        .is_err());
+        assert!(ProcessLimits {
             address_space_mib: Some(512),
             cpu_seconds: Some(10)
         }
@@ -692,13 +704,19 @@ mod tests {
     fn limited_executor_still_captures_output() {
         let root = test_root("limit");
         let token = CancellationToken::default();
+        let script = if cfg!(target_os = "linux") {
+            r#"test "$(ulimit -Sv)" = 262144 && test "$(ulimit -Hv)" = 262144 &&
+               test "$(ulimit -St)" = 10 && test "$(ulimit -Ht)" = 10 && printf bounded"#
+        } else {
+            r#"test "$(ulimit -St)" = 10 && test "$(ulimit -Ht)" = 10 && printf bounded"#
+        };
         let outcome = LocalExecutor
             .run_isolated_limited(
-                &request(&root, "printf bounded"),
+                &request(&root, script),
                 &[],
                 &token,
                 ProcessLimits {
-                    address_space_mib: Some(256),
+                    address_space_mib: cfg!(target_os = "linux").then_some(256),
                     cpu_seconds: Some(10),
                 },
             )

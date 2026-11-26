@@ -58,8 +58,8 @@ Run `./scripts/verify` locally and in CI. The script rejects unapproved crate
 dependencies and records tests and strict lint results. Keep permission and
 resource constraints in executable code. Use one provider launch path for
 local and Worker modes. Remove obsolete implementations and add a regression
-to the user-facing entry point where a failure appeared. Rust unsafe blocks
-carry the safety rationale required by Clippy.
+to the user-facing entry point where a failure appeared. The Rust workspace
+forbids `unsafe` code. Use safe APIs for OS operations.
 [Lauren Tan on verification](https://www.youtube.com/watch?v=NjoZoUm85x0&t=510s) · [Lauren Tan on Dune](https://www.youtube.com/watch?v=NjoZoUm85x0&t=1514s)
 
 ## Plugin strategy (proposed)

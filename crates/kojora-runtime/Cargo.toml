@@ -6,8 +6,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rune-rlimits = "0.2"
+rustix = { version = "1.1", features = ["process"] }
 
 [lints]
 workspace = true
