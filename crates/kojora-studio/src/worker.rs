@@ -252,7 +252,12 @@ fn dispatch(
             prompt,
             mode,
         } => (
-            Response::Id(studio.submit_with_mode(bot_id, &prompt, mode)?),
+            Response::Id(studio.submit_with_post_edit(
+                bot_id,
+                &prompt,
+                mode,
+                checks.post_edit_kinds(),
+            )?),
             false,
         ),
         Request::Cancel { task_id } => {
@@ -409,16 +414,12 @@ pub fn serve_with_checks(
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let studio = Arc::new(studio);
     let for_checks = Arc::clone(&studio);
-    let recovery_state = if studio.recovered_incomplete_runs {
-        None
-    } else {
-        Some(studio.snapshot()?)
-    };
     let checks = CheckQueue::open_for_worker(
         studio.data_dir().join("checks"),
         policy,
         Arc::new(move || for_checks.try_acquire_check_slot()),
-        recovery_state.as_ref(),
+        &studio.snapshot()?,
+        studio.recovered_incomplete_runs,
     )?;
     let running = Arc::new(AtomicBool::new(true));
     let _observer = if checks.has_post_edit_hooks() {
@@ -1065,6 +1066,7 @@ mod tests {
                 exit_code: Some(0),
                 run_dir: None,
                 worktree_dir: Some(worktree),
+                post_edit_checks: None,
                 error: None,
             }],
             ..StudioState::default()

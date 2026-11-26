@@ -5,7 +5,7 @@ use kojora_runtime::{
     CancellationToken, IsolatedExecutor, LocalExecutor, ProcessLimits, RunOutcome, RunSpec,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -31,7 +31,7 @@ pub enum HookPhase {
     PreMerge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckKind {
     RustFmt,
@@ -95,6 +95,8 @@ struct CheckJournal {
     records: Vec<CheckRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     queued_worktrees: BTreeMap<u64, WorktreeIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    next_post_edit: BTreeMap<CheckKind, u64>,
 }
 
 impl Default for CheckJournal {
@@ -103,6 +105,7 @@ impl Default for CheckJournal {
             next_id: 1,
             records: Vec::new(),
             queued_worktrees: BTreeMap::new(),
+            next_post_edit: BTreeMap::new(),
         }
     }
 }
@@ -196,6 +199,48 @@ struct WorktreeIdentity {
     created: SystemTime,
 }
 
+impl WorktreeIdentity {
+    #[cfg(unix)]
+    fn from_metadata(path: PathBuf, metadata: fs::Metadata) -> Option<Self> {
+        if !metadata.is_dir() {
+            return None;
+        }
+        Some(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            created: metadata.created().ok()?,
+        })
+    }
+}
+
+/// The automatic checks opted in for this run and the checkout they may use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostEditChecks {
+    kinds: Vec<CheckKind>,
+    identity: Option<WorktreeIdentity>,
+}
+
+impl PostEditChecks {
+    pub(crate) fn capture(path: &Path, kinds: Vec<CheckKind>) -> Option<Self> {
+        if kinds.is_empty() {
+            return None;
+        }
+        #[cfg(unix)]
+        let identity = (|| {
+            let path = fs::canonicalize(path).ok()?;
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            WorktreeIdentity::from_metadata(path, metadata)
+        })();
+        #[cfg(not(unix))]
+        let identity = {
+            let _ = path;
+            None
+        };
+        Some(Self { kinds, identity })
+    }
+}
+
 impl Job {
     fn open(id: u64, workspace: PathBuf) -> io::Result<Self> {
         let job = Self {
@@ -212,13 +257,10 @@ impl Job {
     fn identity(&self) -> Option<WorktreeIdentity> {
         #[cfg(unix)]
         {
-            let metadata = self.opened_workspace.metadata().ok()?;
-            Some(WorktreeIdentity {
-                path: self.workspace.clone(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                created: metadata.created().ok()?,
-            })
+            WorktreeIdentity::from_metadata(
+                self.workspace.clone(),
+                self.opened_workspace.metadata().ok()?,
+            )
         }
         #[cfg(not(unix))]
         None
@@ -297,8 +339,20 @@ pub struct CheckQueue {
     policy: CheckPolicy,
     activated_ms: u64,
     journal: Arc<Mutex<CheckJournal>>,
-    observed_post_edit: Arc<Mutex<HashSet<(u64, CheckKind)>>>,
+    observer: Arc<Mutex<()>>,
+    started_at_task: Option<u64>,
     sender: mpsc::Sender<Job>,
+}
+
+struct WorkerStartup<'a> {
+    state: &'a crate::StudioState,
+    recovered_incomplete_runs: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PostEditObservation<'a> {
+    next_task: u64,
+    identity: Option<&'a WorktreeIdentity>,
 }
 
 impl CheckQueue {
@@ -327,14 +381,18 @@ impl CheckQueue {
         root: impl Into<PathBuf>,
         policy: CheckPolicy,
         admission: Arc<CheckAdmission>,
-        state: Option<&crate::StudioState>,
+        state: &crate::StudioState,
+        recovered_incomplete_runs: bool,
     ) -> io::Result<Self> {
         Self::open_with_runner_and_admission(
             root,
             policy,
             Arc::new(execute_builtin),
             Some(admission),
-            state,
+            Some(WorkerStartup {
+                state,
+                recovered_incomplete_runs,
+            }),
         )
     }
 
@@ -351,7 +409,7 @@ impl CheckQueue {
         policy: CheckPolicy,
         runner: Arc<CheckRunner>,
         admission: Option<Arc<CheckAdmission>>,
-        recovery_state: Option<&crate::StudioState>,
+        startup: Option<WorkerStartup<'_>>,
     ) -> io::Result<Self> {
         policy.validate()?;
         let root = root.into();
@@ -413,12 +471,16 @@ impl CheckQueue {
             Err(error) => return Err(error),
         };
         // A previously started check could still be alive after a Worker crash.
-        let recovery_state = recovery_state.filter(|_| {
-            !journal
-                .records
-                .iter()
-                .any(|record| record.status == CheckStatus::Running)
-        });
+        let recovery_state = startup
+            .as_ref()
+            .filter(|startup| {
+                !startup.recovered_incomplete_runs
+                    && !journal
+                        .records
+                        .iter()
+                        .any(|record| record.status == CheckStatus::Running)
+            })
+            .map(|startup| startup.state);
         let mut identities = std::mem::take(&mut journal.queued_worktrees);
         let mut recovered = !identities.is_empty();
         let mut ready = Vec::new();
@@ -445,6 +507,29 @@ impl CheckQueue {
             record.error = Some(reason.into());
             record.finished_ms = Some(now_ms());
             recovered = true;
+        }
+        let started_at_task = startup.map(|startup| startup.state.next_id);
+        if let Some(next_id) = started_at_task {
+            let next_post_edit = policy
+                .post_edit
+                .iter()
+                .copied()
+                .map(|kind| {
+                    let next = if recovery_state.is_some() {
+                        journal
+                            .next_post_edit
+                            .get(&kind)
+                            .copied()
+                            .unwrap_or(next_id)
+                            .min(next_id)
+                    } else {
+                        next_id
+                    };
+                    (kind, next)
+                })
+                .collect();
+            recovered |= journal.next_post_edit != next_post_edit;
+            journal.next_post_edit = next_post_edit;
         }
         if recovered {
             persist(&root, &journal)?;
@@ -479,7 +564,8 @@ impl CheckQueue {
             policy,
             activated_ms,
             journal,
-            observed_post_edit: Arc::new(Mutex::new(HashSet::new())),
+            observer: Arc::new(Mutex::new(())),
+            started_at_task,
             sender,
         })
     }
@@ -522,6 +608,11 @@ impl CheckQueue {
         !self.policy.post_edit.is_empty()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn post_edit_kinds(&self) -> &[CheckKind] {
+        &self.policy.post_edit
+    }
+
     pub fn pending_count(&self) -> usize {
         self.journal.lock().map_or(0, |journal| {
             journal
@@ -541,6 +632,17 @@ impl CheckQueue {
         kind: CheckKind,
         workspace: &Path,
     ) -> io::Result<u64> {
+        self.enqueue_with_observation(task_id, hook, kind, workspace, None)
+    }
+
+    fn enqueue_with_observation(
+        &self,
+        task_id: u64,
+        hook: HookPhase,
+        kind: CheckKind,
+        workspace: &Path,
+        observation: Option<PostEditObservation<'_>>,
+    ) -> io::Result<u64> {
         if !self.policy.permits(hook, kind) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -556,7 +658,11 @@ impl CheckQueue {
                 && (hook == HookPhase::PostEdit
                     || matches!(record.status, CheckStatus::Queued | CheckStatus::Running))
         }) {
-            return Ok(existing.id);
+            let id = existing.id;
+            if let Some(observation) = observation {
+                self.advance_post_edit(&mut journal, kind, observation.next_task)?;
+            }
+            return Ok(id);
         }
         if journal
             .records
@@ -587,6 +693,17 @@ impl CheckQueue {
         }
         let id = proposed.next_id;
         let job = Job::open(id, actual)?;
+        if let Some(observation) = observation {
+            if let Some(identity) = observation.identity {
+                if job.identity().as_ref() != Some(identity) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "post-edit worktree no longer matches the task checkout",
+                    ));
+                }
+            }
+            proposed.next_post_edit.insert(kind, observation.next_task);
+        }
         if let Some(identity) = job.identity() {
             proposed.queued_worktrees.insert(id, identity);
         }
@@ -626,7 +743,11 @@ impl CheckQueue {
 
     /// Schedule configured hooks for newly completed edit tasks.
     pub fn observe_post_edit(&self, studio: &crate::StudioState) {
-        let _ = self.try_observe_post_edit(studio);
+        if let Err(error) = self.try_observe_post_edit(studio) {
+            if error.kind() != io::ErrorKind::WouldBlock {
+                eprintln!("could not observe post-edit checks: {error}");
+            }
+        }
     }
 
     /// Report transient queue saturation so shutdown cannot discard an unqueued hook.
@@ -634,37 +755,114 @@ impl CheckQueue {
         if self.policy.post_edit.is_empty() {
             return Ok(());
         }
-        let mut observed = self.observed_post_edit.lock().map_err(lock_error)?;
+        let _observer = self.observer.lock().map_err(lock_error)?;
+        let mut cursors = {
+            let journal = self.journal.lock().map_err(lock_error)?;
+            self.policy
+                .post_edit
+                .iter()
+                .map(|&kind| {
+                    (
+                        kind,
+                        journal
+                            .next_post_edit
+                            .get(&kind)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        // The Studio appends tasks in ID order. Pending checks require the
+        // same exclusive slot that an unfinished edit already holds.
         for task in &studio.tasks {
             if task.mode != crate::AgentMode::EditWorktree
-                || task.status != crate::TaskStatus::Succeeded
+                || cursors.values().all(|&next| next > task.id)
             {
                 continue;
             }
-            let Some(run) = studio.runs.iter().find(|r| r.task_id == task.id) else {
-                continue;
-            };
-            // Enabling hooks never backfills the whole old Task history.
-            if run.finished_ms.unwrap_or(0) < self.activated_ms {
+            if task.status == crate::TaskStatus::Running {
+                break;
+            }
+            if task.status != crate::TaskStatus::Succeeded {
                 continue;
             }
+            let Some(run) = studio.runs.iter().find(|run| {
+                run.id == task.run_id
+                    && run.task_id == task.id
+                    && run.status == crate::TaskStatus::Succeeded
+            }) else {
+                continue;
+            };
             let Some(worktree) = &run.worktree_dir else {
                 continue;
             };
-            for kind in &self.policy.post_edit {
-                let key = (task.id, *kind);
-                if observed.contains(&key) {
+            let (kinds, identity) = if let Some(started_at_task) = self.started_at_task {
+                let Some(checks) = &run.post_edit_checks else {
+                    continue;
+                };
+                if task.id < started_at_task && checks.identity.is_none() {
                     continue;
                 }
-                match self.enqueue(task.id, HookPhase::PostEdit, *kind, worktree) {
-                    Ok(_) => {
-                        // Remember accepted hooks after their history records are evicted.
-                        observed.insert(key);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
-                    Err(error) => eprintln!("post-edit check for task {}: {error}", task.id),
+                (checks.kinds.as_slice(), checks.identity.as_ref())
+            } else {
+                if run.finished_ms.unwrap_or(0) < self.activated_ms {
+                    continue;
                 }
+                (self.policy.post_edit.as_slice(), None)
+            };
+            for &kind in &self.policy.post_edit {
+                let next = cursors.entry(kind).or_default();
+                if *next > task.id || !kinds.contains(&kind) {
+                    continue;
+                }
+                let observation = PostEditObservation {
+                    next_task: task.id.saturating_add(1),
+                    identity,
+                };
+                match self.enqueue_with_observation(
+                    task.id,
+                    HookPhase::PostEdit,
+                    kind,
+                    worktree,
+                    Some(observation),
+                ) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                        ) =>
+                    {
+                        eprintln!("post-edit check for task {}: {error}", task.id);
+                        let mut journal = self.journal.lock().map_err(lock_error)?;
+                        self.advance_post_edit(&mut journal, kind, observation.next_task)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+                *next = observation.next_task;
             }
+        }
+        Ok(())
+    }
+
+    fn advance_post_edit(
+        &self,
+        journal: &mut CheckJournal,
+        kind: CheckKind,
+        next_task: u64,
+    ) -> io::Result<()> {
+        if next_task
+            > journal
+                .next_post_edit
+                .get(&kind)
+                .copied()
+                .unwrap_or_default()
+        {
+            let mut proposed = journal.clone();
+            proposed.next_post_edit.insert(kind, next_task);
+            persist(&self.root, &proposed)?;
+            *journal = proposed;
         }
         Ok(())
     }
@@ -965,6 +1163,7 @@ mod tests {
                 exit_code: Some(0),
                 run_dir: None,
                 worktree_dir: Some(worktree),
+                post_edit_checks: None,
                 error: None,
             }],
             ..crate::StudioState::default()
@@ -1354,6 +1553,7 @@ mod tests {
                     ..queued
                 },
             ],
+            next_post_edit: BTreeMap::new(),
             queued_worktrees: BTreeMap::from([
                 (1, identity.clone()),
                 (4, replaced_identity),
@@ -1373,7 +1573,10 @@ mod tests {
             policy.clone(),
             Arc::clone(&runner),
             None,
-            Some(&state),
+            Some(WorkerStartup {
+                state: &state,
+                recovered_incomplete_runs: false,
+            }),
         )
         .unwrap();
         for _ in 0..200 {
@@ -1401,7 +1604,10 @@ mod tests {
             policy,
             runner,
             None,
-            Some(&state),
+            Some(WorkerStartup {
+                state: &state,
+                recovered_incomplete_runs: false,
+            }),
         )
         .unwrap();
         assert_eq!(restarted.pending_count(), 0);
@@ -1412,6 +1618,97 @@ mod tests {
             .all(|record| record.status == CheckStatus::Interrupted));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_observes_an_edit_saved_before_the_hook_was_queued() {
+        let (root, policy, worktree) = setup();
+        let checks_root = root.join("checks");
+        let runner: Arc<CheckRunner> =
+            Arc::new(|_, _, _, _, _| Err(io::Error::other("fixture ran")));
+        let initial = crate::StudioState::default();
+        let open = |state: &crate::StudioState| {
+            CheckQueue::open_with_runner_and_admission(
+                &checks_root,
+                policy.clone(),
+                Arc::clone(&runner),
+                None,
+                Some(WorkerStartup {
+                    state,
+                    recovered_incomplete_runs: false,
+                }),
+            )
+            .unwrap()
+        };
+        let first = open(&initial);
+        let mut finished = completed_edit(first.activated_ms, worktree.clone());
+        finished.runs[0].post_edit_checks =
+            PostEditChecks::capture(&worktree, policy.post_edit.clone());
+        drop(first);
+
+        let reopened = open(&finished);
+        reopened.try_observe_post_edit(&finished).unwrap();
+        let records = reopened.snapshot().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].task_id, 1);
+        assert_eq!(records[0].hook, HookPhase::PostEdit);
+        for _ in 0..200 {
+            if reopened.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(reopened.pending_count(), 0);
+        {
+            // Simulate history eviction. Deduplication must survive without
+            // the old check record in the journal.
+            let mut journal = reopened.journal.lock().unwrap();
+            assert_eq!(journal.records[0].error.as_deref(), Some("fixture ran"));
+            journal.records.clear();
+            persist(&checks_root, &journal).unwrap();
+        }
+        drop(reopened);
+        let reopened = open(&finished);
+        reopened.try_observe_post_edit(&finished).unwrap();
+        assert!(reopened.snapshot().unwrap().is_empty());
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_rejects_unobserved_hooks_for_a_replacement_worktree() {
+        let (root, policy, worktree) = setup();
+        let checks_root = root.join("checks");
+        let runner: Arc<CheckRunner> =
+            Arc::new(|_, _, _, _, _| panic!("check ran in a replaced checkout"));
+        let initial = crate::StudioState::default();
+        let open = |state: &crate::StudioState| {
+            CheckQueue::open_with_runner_and_admission(
+                &checks_root,
+                policy.clone(),
+                Arc::clone(&runner),
+                None,
+                Some(WorkerStartup {
+                    state,
+                    recovered_incomplete_runs: false,
+                }),
+            )
+            .unwrap()
+        };
+        drop(open(&initial));
+        let mut finished = completed_edit(now_ms(), worktree.clone());
+        finished.runs[0].post_edit_checks =
+            PostEditChecks::capture(&worktree, policy.post_edit.clone());
+        fs::rename(&worktree, root.join("original-checkout")).unwrap();
+        fs::create_dir(&worktree).unwrap();
+
+        let reopened = open(&finished);
+        reopened.try_observe_post_edit(&finished).unwrap();
+        assert!(reopened.snapshot().unwrap().is_empty());
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
