@@ -796,16 +796,17 @@ fn create_detached_worktree(
 ) -> io::Result<PathBuf> {
     let workspace = fs::canonicalize(workspace)?;
     let output = git_command(&workspace)
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["rev-parse", "--is-inside-work-tree", "--show-prefix"])
         .output()?;
-    if !output.status.success() {
+    let mut fields = output.stdout.splitn(2, |&byte| byte == b'\n');
+    if !output.status.success() || !matches!(fields.next(), Some(b"true" | b"true\r")) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "workspace is not a Git checkout",
         ));
     }
-    let git_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if fs::canonicalize(&git_root)? != workspace {
+    // An empty prefix means Git started at the checkout root.
+    if !matches!(fields.next(), Some(b"\n" | b"\r\n")) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Bot workspace must be the root of its Git checkout",
@@ -1540,7 +1541,12 @@ mod tests {
     #[test]
     fn edit_mode_never_mutates_original_checkout() {
         let root = temporary_root("worktree");
-        let project = root.join("checkout");
+        // A Unix path can end with whitespace, including a newline.
+        let project = if cfg!(windows) {
+            root.join("checkout")
+        } else {
+            root.join("checkout \n")
+        };
         fs::create_dir(&project).unwrap();
         fs::write(project.join("file.txt"), "initial\n").unwrap();
         commit_checkout_fixture(&project);
