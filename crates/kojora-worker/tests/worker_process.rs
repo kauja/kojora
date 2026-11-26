@@ -43,10 +43,8 @@ fn worker_process_runs_account_profiles_and_outlives_clients() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root: PathBuf = std::env::temp_dir().join(format!(
-        "kojora-worker-process-{}-{now}",
-        std::process::id()
-    ));
+    // Leave space for the socket name under a long macOS temporary path.
+    let root: PathBuf = std::env::temp_dir().join(format!("kjp-{}-{now:x}", std::process::id()));
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let bin_dir = root.join("bin");
@@ -65,13 +63,19 @@ printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).unwrap();
 
+    // The macOS launcher can already map more than 8 GiB of virtual space.
+    let address_space_mib = if cfg!(target_os = "macos") {
+        1024 * 1024
+    } else {
+        8192
+    };
     let binary = env!("CARGO_BIN_EXE_kojora-worker");
     let child = Command::new(binary)
         .args([
             "--data-dir",
             root.to_str().expect("UTF8 test directory"),
             "--address-space-mib",
-            "8192",
+            &address_space_mib.to_string(),
             "--cpu-seconds",
             "120",
         ])
@@ -99,7 +103,10 @@ printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}
     let client = client.expect("standalone worker must accept local connections");
     let first_pid = client.status().unwrap().pid;
     assert_eq!(first_pid, guard.0.id());
-    assert_eq!(client.status().unwrap().address_space_mib, Some(8192));
+    assert_eq!(
+        client.status().unwrap().address_space_mib,
+        Some(address_space_mib)
+    );
     assert_eq!(client.status().unwrap().cpu_seconds, Some(120));
     assert!(client.snapshot().unwrap().bots.is_empty());
 

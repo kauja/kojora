@@ -575,9 +575,10 @@ mod tests {
         let (spec, variables) = call.as_ref().expect("one invocation");
         assert_eq!(spec.program, OsString::from("codex"));
         assert_eq!(spec.cwd, workspace);
+        let canonical_profile = fs::canonicalize(&profile).unwrap();
         assert!(variables
             .iter()
-            .any(|(name, value)| name == "CODEX_HOME" && value == profile.as_os_str()));
+            .any(|(name, value)| name == "CODEX_HOME" && value == canonical_profile.as_os_str()));
         assert!(!variables.iter().any(|(name, _)| name == "GITHUB_TOKEN"
             || name == "OPENAI_API_KEY"
             || name == "ANTHROPIC_API_KEY"));

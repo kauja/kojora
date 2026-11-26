@@ -8,7 +8,7 @@ Worker shutdown is explicitly rejected while the task is active.
 
 ```sh
 mkdir -p "$HOME/.local/state/kojora" && chmod 700 "$HOME/.local/state/kojora"
-cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --address-space-mib 8192 --cpu-seconds 900
+cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --cpu-seconds 900
 cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/kojora/worker.sock"
 cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --status
 cargo run -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --stop
@@ -60,9 +60,10 @@ a running task to stop that specific run.
 | `--max-parallel N` and memory reservations | Studio admission | Active task count and configured reservation budget | Operating system memory use or other host processes |
 
 The numeric limits are optional; without them the Worker does not apply
-process-specific memory/CPU ceilings. RLIMIT_AS can prevent a provider from
-starting if it reserves large virtual address ranges even at low RSS.
-Test values on the intended host before enabling them in production.
+process-specific memory/CPU ceilings. Choose the address-space ceiling on the
+intended host. On macOS the launcher's existing virtual mappings can already
+exceed a ceiling of 8192 MiB. If the kernel rejects a requested ceiling,
+the Worker records a spawn failure.
 
 ## Centrally controlled local checks
 
