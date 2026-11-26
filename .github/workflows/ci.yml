@@ -64,3 +64,5 @@ jobs:
           toolchain: 1.100.0
       - name: Check native desktop on macOS
         run: cargo check --locked -p kojora-desktop --all-targets
+      - name: Test process execution on macOS
+        run: cargo test --locked -p kojora-runtime

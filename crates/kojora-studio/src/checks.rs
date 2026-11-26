@@ -436,9 +436,8 @@ impl CheckQueue {
                 "checks directory must be a real private directory",
             ));
         }
-        // SAFETY: geteuid reads the effective user ID without dereferencing pointers.
         #[cfg(unix)]
-        let owner = unsafe { libc::geteuid() };
+        let owner = rustix::process::geteuid().as_raw();
         #[cfg(unix)]
         if metadata.uid() != owner || metadata.permissions().mode() & 0o077 != 0 {
             return Err(io::Error::new(
