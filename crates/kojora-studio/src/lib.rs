@@ -13,7 +13,9 @@ pub use kojora_agents::AgentProvider;
 use kojora_agents::{
     run_agent_cancellable, run_agent_cancellable_limited, AgentAdapter, AgentRequest,
 };
-use kojora_runtime::{CancellationToken, LocalExecutor, ProcessLimits, RunOutcome};
+use kojora_runtime::{
+    quiet_status_cancellable, CancellationToken, LocalExecutor, ProcessLimits, RunOutcome,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -512,47 +514,49 @@ impl Studio {
                 // Release the worker's lock before the guard frees the reservation.
                 let _instance_lock = instance_lock;
                 let task_log_root = root.join("runs").join(format!("task-{task_id}"));
-                let outcome = if cancellation.is_cancelled() {
-                    Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "task cancelled before launch",
-                    ))
-                } else {
-                    match mode {
-                        AgentMode::Inspect => {
-                            runner(&bot, &prompt, &task_log_root, mode, &cancellation)
+                let outcome =
+                    if cancellation.is_cancelled() {
+                        Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "task cancelled before launch",
+                        ))
+                    } else {
+                        match mode {
+                            AgentMode::Inspect => {
+                                runner(&bot, &prompt, &task_log_root, mode, &cancellation)
+                            }
+                            AgentMode::EditWorktree => create_detached_worktree(
+                                &root,
+                                &bot.workspace,
+                                task_id,
+                                &cancellation,
+                            )
+                            .and_then(|path| {
+                                {
+                                    let mut state = shared_state.lock().map_err(lock_error)?;
+                                    let mut candidate = state.clone();
+                                    let run = candidate
+                                        .runs
+                                        .iter_mut()
+                                        .find(|run| run.id == run_id)
+                                        .ok_or_else(|| {
+                                            io::Error::new(io::ErrorKind::NotFound, "run not found")
+                                        })?;
+                                    run.worktree_dir = Some(path.clone());
+                                    commit_state(&root, &mut state, candidate)?;
+                                }
+                                if cancellation.is_cancelled() {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        "task cancelled before agent launch",
+                                    ));
+                                }
+                                let mut isolated_bot = bot;
+                                isolated_bot.workspace = path;
+                                runner(&isolated_bot, &prompt, &task_log_root, mode, &cancellation)
+                            }),
                         }
-                        AgentMode::EditWorktree => create_detached_worktree(
-                            &root,
-                            &bot.workspace,
-                            task_id,
-                        )
-                        .and_then(|path| {
-                            {
-                                let mut state = shared_state.lock().map_err(lock_error)?;
-                                let mut candidate = state.clone();
-                                let run = candidate
-                                    .runs
-                                    .iter_mut()
-                                    .find(|run| run.id == run_id)
-                                    .ok_or_else(|| {
-                                        io::Error::new(io::ErrorKind::NotFound, "run not found")
-                                    })?;
-                                run.worktree_dir = Some(path.clone());
-                                commit_state(&root, &mut state, candidate)?;
-                            }
-                            if cancellation.is_cancelled() {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "task cancelled before agent launch",
-                                ));
-                            }
-                            let mut isolated_bot = bot;
-                            isolated_bot.workspace = path;
-                            runner(&isolated_bot, &prompt, &task_log_root, mode, &cancellation)
-                        }),
-                    }
-                };
+                    };
                 let mut state = match shared_state.lock() {
                     Ok(state) => state,
                     Err(_) => return,
@@ -760,7 +764,12 @@ fn git_command(workspace: &Path) -> Command {
     command
 }
 
-fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::Result<PathBuf> {
+fn create_detached_worktree(
+    root: &Path,
+    workspace: &Path,
+    task_id: u64,
+    cancellation: &CancellationToken,
+) -> io::Result<PathBuf> {
     let workspace = fs::canonicalize(workspace)?;
     let output = git_command(&workspace)
         .args(["rev-parse", "--show-toplevel"])
@@ -793,12 +802,12 @@ fn create_detached_worktree(root: &Path, workspace: &Path, task_id: u64) -> io::
             "task worktree already exists",
         ));
     }
-    let status = git_command(&workspace)
+    let mut command = git_command(&workspace);
+    command
         .args(["worktree", "add", "--detach"])
         .arg(&destination)
-        .arg("HEAD")
-        .stdout(Stdio::null())
-        .status()?;
+        .arg("HEAD");
+    let status = quiet_status_cancellable(&mut command, cancellation)?;
     if !status.success() {
         return Err(io::Error::other(
             "Git could not create a detached task worktree",
@@ -1420,24 +1429,15 @@ mod tests {
         assert_eq!(bot.profile_dir, Path::new("/profile"));
     }
 
-    #[test]
-    fn edit_mode_never_mutates_original_checkout() {
-        let root = temporary_root("worktree");
-        let project = root.join("checkout");
-        fs::create_dir(&project).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .arg(&project)
+    fn commit_checkout_fixture(project: &Path) {
+        let status = git_command(project).arg("init").status().unwrap();
+        assert!(status.success());
+        let status = git_command(project)
+            .args(["add", "--all"])
             .status()
             .unwrap();
         assert!(status.success());
-        fs::write(project.join("file.txt"), "initial\n").unwrap();
-        let status = git_command(&project)
-            .args(["add", "file.txt"])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = git_command(&project)
+        let status = git_command(project)
             .args([
                 "-c",
                 "user.name=Kojora",
@@ -1449,7 +1449,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
 
+    #[test]
+    fn edit_mode_never_mutates_original_checkout() {
+        let root = temporary_root("worktree");
+        let project = root.join("checkout");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("file.txt"), "initial\n").unwrap();
+        commit_checkout_fixture(&project);
         let studio_root = root.join("state");
         let state_root = studio_root.clone();
         let fake: Arc<AgentRunner> =
@@ -1510,6 +1518,93 @@ mod tests {
             .args(["worktree", "remove", "--force"])
             .arg(worktree)
             .status();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_an_edit_stops_git_checkout_before_agent_launch() {
+        let root = temporary_root("cancel-worktree");
+        let project = root.join("checkout");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("file.txt"), "initial\n").unwrap();
+        fs::write(project.join(".gitattributes"), "file.txt filter=slow\n").unwrap();
+        commit_checkout_fixture(&project);
+        let filter = root.join("filter.sh");
+        fs::write(
+            &filter,
+            "cd \"$(dirname \"$0\")\" || exit 1\n\
+             touch ready\n\
+             attempts=0\n\
+             while [ ! -f release ] && [ \"$attempts\" -lt 100 ]; do\n\
+             sleep 0.1\n\
+             attempts=$((attempts + 1))\n\
+             done\n\
+             cat\n",
+        )
+        .unwrap();
+        let command = format!(
+            "sh '{}'",
+            filter.display().to_string().replace('\'', "'\\''")
+        );
+        assert!(git_command(&project)
+            .args(["config", "filter.slow.smudge", &command])
+            .status()
+            .unwrap()
+            .success());
+
+        let studio_root = root.join("state");
+        let studio = Studio::open_with_runner(
+            &studio_root,
+            Arc::new(|_, _, _, _, _| panic!("agent launched after cancellation")),
+        )
+        .unwrap();
+        let bot = studio
+            .add_bot("Editor", project.clone(), root.join("profile"))
+            .unwrap();
+        let task = studio
+            .submit_with_mode(bot, "Modify file", AgentMode::EditWorktree)
+            .unwrap();
+        let ready = root.join("ready");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "Git did not launch the checkout filter");
+        studio.cancel_task(task).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while studio.is_active() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let stopped_while_filter_was_blocked = !studio.is_active();
+        fs::write(root.join("release"), "").unwrap();
+        assert!(stopped_while_filter_was_blocked);
+
+        let persisted = read_state(&studio_root).unwrap();
+        assert_eq!(persisted.tasks[0].status, TaskStatus::Cancelled);
+        assert_eq!(persisted.runs[0].status, TaskStatus::Cancelled);
+        assert!(persisted.runs[0].worktree_dir.is_none());
+        assert!(!studio_root
+            .join("worktrees")
+            .join(format!("task-{task}"))
+            .exists());
+        let worktrees = git_command(&project)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(worktrees.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&worktrees.stdout)
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("file.txt")).unwrap(),
+            "initial\n"
+        );
+        drop(studio);
         fs::remove_dir_all(root).unwrap();
     }
 

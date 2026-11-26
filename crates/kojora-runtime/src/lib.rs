@@ -36,6 +36,30 @@ impl CancellationToken {
     }
 }
 
+/// Run a trusted command with no standard input or output. On Unix,
+/// cancellation terminates the command's dedicated process group.
+pub fn quiet_status_cancellable(
+    command: &mut Command,
+    cancellation: &CancellationToken,
+) -> io::Result<ExitStatus> {
+    let interrupted = || io::Error::new(io::ErrorKind::Interrupted, "command cancelled");
+    if cancellation.is_cancelled() {
+        return Err(interrupted());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let (status, cancelled) = wait_child(&mut child, Some(cancellation), || true)?;
+    if cancelled && !status.success() {
+        return Err(interrupted());
+    }
+    Ok(status)
+}
+
 /// Per-process Unix RLIMIT ceilings. These are not host-wide RSS or CPU
 /// quotas: RLIMIT_AS caps virtual address space and RLIMIT_CPU caps CPU
 /// seconds per process (not summed across descendants).
