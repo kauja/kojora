@@ -68,6 +68,20 @@ workspace rejection in the private run log and propagates its exit status.
   Provider login and Keychain behavior require a signed-in smoke test on
   the target machine.
 
+## Signed-in smoke test
+
+Select a private signed-in test profile and an installed provider. The
+opt-in test sends a read-only request against a temporary Git checkout
+with a synthetic marker. It uses the live provider service.
+
+```sh
+KOJORA_LIVE_SMOKE_PROVIDER=codex \
+KOJORA_LIVE_SMOKE_PROFILE="/absolute/path/to/test-profile" \
+  cargo test --locked -p kojora-cli --test live_agent_profiles -- --ignored
+```
+
+Set the provider to `claude-code` to verify a Claude Code profile.
+
 ## Adapter extension points
 
 Implement `AgentAdapter` in `kojora-agents` and register the provider's
