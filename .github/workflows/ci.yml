@@ -63,4 +63,4 @@ jobs:
         with:
           toolchain: 1.100.0
       - name: Test workspace on macOS
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
