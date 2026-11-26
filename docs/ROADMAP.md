@@ -18,7 +18,7 @@ Milestones are capability targets, not release-date promises.
 - [ ] Crash-safe independent worker supervision and orphan reconciliation
 - [x] Local durable Bot/Task/Run/Session metadata and interrupted-run markers (experimental)
 - [ ] True resumable sessions and robust crash/process reconciliation
-- [ ] Isolate provider configuration/authentication profiles
+- [x] Isolate configured provider profiles and verify exclusive use with local fixtures
 - [x] Private versioned Unix-domain Worker control API (experimental)
 - [ ] Structured event subscription and remote control API
 

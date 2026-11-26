@@ -43,6 +43,9 @@ cargo run --locked -p kojora-cli -- agent codex \
   -- "Summarize the architecture of this workspace"
 ```
 
+Use a trusted Git checkout for Codex inspection. Kojora records a Codex
+workspace rejection in the private run log and propagates its exit status.
+
 ## Execution and verification
 
 - A run receives the canonical account directory as `HOME` and as the
@@ -59,10 +62,11 @@ cargo run --locked -p kojora-cli -- agent codex \
 - The process runner records start, exit, cancellation, and bounded-memory
   output collection. Inspect the private run directory for stderr and raw
   JSONL. Agent output can contain sensitive project information.
-- CI tests launch a fixture through the real Kojora CLI and verify that two
-  account profiles receive distinct paths and that parent secrets are
-  cleared. Provider login and Keychain behavior require a signed-in smoke
-  test on the target machine.
+- CI exercises both adapters through the real Kojora CLI with test executables.
+  It verifies distinct account paths, cross-process exclusion for aliases of
+  a single profile, removal of parent secrets, and nonzero exit recording.
+  Provider login and Keychain behavior require a signed-in smoke test on
+  the target machine.
 
 ## Adapter extension points
 
