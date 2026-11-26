@@ -385,10 +385,36 @@ fn wait_child(
 
 #[cfg(unix)]
 fn signal_group(child: &Child, signal: Signal) -> io::Result<()> {
-    match kill_process_group(Pid::from_child(child), signal) {
+    let group = Pid::from_child(child);
+    match kill_process_group(group, signal) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::PERM) if macos_group_has_no_live_process(group) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_has_no_live_process(group: Pid) -> bool {
+    // Darwin can return EPERM if only zombies remain in a process group.
+    // Check every member while the unreaped child still reserves the group ID.
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "state="])
+        .env_clear()
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && !output.stdout.is_empty()
+        && String::from_utf8_lossy(&output.stdout).lines().all(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let id = fields.next().and_then(|value| value.parse::<i32>().ok());
+            match (id, fields.next()) {
+                (Some(id), Some(state)) => id != group.as_raw_pid() || state.starts_with('Z'),
+                _ => false,
+            }
+        })
 }
 
 /// Fixed-size buffers keep log capture independent of total output volume.
