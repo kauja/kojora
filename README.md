@@ -106,7 +106,7 @@ Both use one owner-private Unix socket; only the Worker holds the state lock.
 ```sh
 mkdir -p "$HOME/.local/state/kojora" && chmod 700 "$HOME/.local/state/kojora"
 # Terminal 1: Worker process with explicit CPU and virtual-memory ceilings
-cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --cpu-seconds 900 --address-space-mib 8192
+cargo run --release -p kojora-worker -- --data-dir "$HOME/.local/state/kojora" --cpu-seconds 900
 # Terminal 2: GUI client (can disconnect and reconnect)
 cargo run --release -p kojora-desktop -- --worker-socket "$HOME/.local/state/kojora/worker.sock"
 # Terminal 3: status and clean shutdown (refused while a task is active)
