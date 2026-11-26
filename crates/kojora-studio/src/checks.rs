@@ -180,7 +180,37 @@ type CheckRunner = dyn Fn(&Path, &Path, CheckKind, &CancellationToken, &CheckPol
 struct Job {
     id: u64,
     workspace: PathBuf,
+    #[cfg(unix)]
+    opened_workspace: File,
     token: CancellationToken,
+}
+
+impl Job {
+    fn verify_workspace(&self) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(&self.workspace).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("check worktree is unavailable: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "check worktree is no longer a real directory",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let opened = self.opened_workspace.metadata()?;
+            if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "check worktree was replaced after queueing",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -391,14 +421,17 @@ impl CheckQueue {
                 "check is not enabled for this hook",
             ));
         }
-        let expected = self
+        let worktrees = self
             .root
             .parent()
             .ok_or_else(|| io::Error::other("check root has no parent"))?
-            .join("worktrees")
-            .join(format!("task-{task_id}"));
+            .join("worktrees");
+        let expected = worktrees.join(format!("task-{task_id}"));
         let actual = fs::canonicalize(workspace)?;
-        if fs::canonicalize(&expected)? != actual || !actual.is_dir() {
+        if !fs::symlink_metadata(&worktrees)?.file_type().is_dir()
+            || !fs::symlink_metadata(&expected)?.file_type().is_dir()
+            || fs::canonicalize(&expected)? != actual
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "check must use the task's own detached Git worktree",
@@ -442,6 +475,14 @@ impl CheckQueue {
             }
         }
         let id = proposed.next_id;
+        let job = Job {
+            id,
+            #[cfg(unix)]
+            opened_workspace: File::open(&actual)?,
+            workspace: actual,
+            token: CancellationToken::default(),
+        };
+        job.verify_workspace()?;
         proposed.next_id = id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("check ID exhausted"))?;
@@ -458,15 +499,7 @@ impl CheckQueue {
         });
         persist(&self.root, &proposed)?;
         *journal = proposed;
-        if self
-            .sender
-            .send(Job {
-                id,
-                workspace: actual,
-                token: CancellationToken::default(),
-            })
-            .is_err()
-        {
+        if self.sender.send(job).is_err() {
             let mut candidate = journal.clone();
             if let Some(record) = candidate.records.iter_mut().find(|r| r.id == id) {
                 record.status = CheckStatus::Interrupted;
@@ -586,7 +619,7 @@ fn execute_job(
 
     let timed_out = Arc::new(AtomicBool::new(false));
     let timed_out_worker = Arc::clone(&timed_out);
-    let token = job.token;
+    let token = &job.token;
     let stopper = token.clone();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let timeout = Duration::from_secs(policy.timeout_secs);
@@ -600,7 +633,9 @@ fn execute_job(
         }
     });
     let log_root = root.join("runs").join(format!("check-{}", job.id));
-    let outcome = runner(&job.workspace, &log_root, kind, &token, policy);
+    let outcome = job
+        .verify_workspace()
+        .and_then(|()| runner(&job.workspace, &log_root, kind, token, policy));
     drop(done_tx);
     let _ = watcher.join();
 
@@ -1100,6 +1135,57 @@ mod tests {
         assert_eq!(checks.pending_count(), 0);
         drop(checks);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_check_does_not_run_in_a_replacement_worktree() {
+        let (root, policy, worktree) = setup();
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let runner: Arc<CheckRunner> = Arc::new(move |_, _, kind, token, _| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            if kind == CheckKind::RustFmt {
+                while !gate.load(Ordering::Acquire) && !token.is_cancelled() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(io::Error::other("fake check result"))
+        });
+        let checks = CheckQueue::open_with_runner(root.join("checks"), policy, runner).unwrap();
+        checks
+            .enqueue(1, HookPhase::Manual, CheckKind::RustFmt, &worktree)
+            .unwrap();
+        for _ in 0..200 {
+            if runs.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let queued = checks
+            .enqueue(1, HookPhase::Manual, CheckKind::RustClippy, &worktree)
+            .unwrap();
+        fs::rename(&worktree, root.join("original-worktree")).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        release.store(true, Ordering::Release);
+        for _ in 0..200 {
+            if checks.pending_count() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let records = checks.snapshot().unwrap();
+        assert_eq!(checks.pending_count(), 0);
+        drop(checks);
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let rejected = records.iter().find(|record| record.id == queued).unwrap();
+        assert_eq!(rejected.status, CheckStatus::Failed);
+        assert!(rejected.error.as_deref().unwrap().contains("worktree"));
     }
 
     #[test]
