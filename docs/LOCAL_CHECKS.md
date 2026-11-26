@@ -49,6 +49,8 @@ subprocess runs at once, with bounded pending jobs (default 16),
 wall-clock timeout (default 300 seconds), private stdout/stderr logs
 and atomic check status journaling (`checks/checks.json`). On restart,
 incomplete checks are marked Interrupted rather than blindly resumed.
+On Unix, a queued check also revalidates its worktree before launch and
+records a failure if the directory was moved or replaced.
 
 ## Security and performance limits
 
